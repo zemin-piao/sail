@@ -7,6 +7,10 @@ use arrow::array::{
     TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::Schema as ArrowSchema;
+use arrow_avro::reader::ReaderBuilder as AvroReaderBuilder;
+use arrow_avro::schema::{
+    AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore as AvroSchemaStore,
+};
 use arrow_json::ReaderBuilder as JsonReaderBuilder;
 use datafusion::common::{DataFusionError, Result};
 use futures::stream::{self, Stream};
@@ -193,9 +197,10 @@ impl StreamState {
 
         let batch = match &self.encoding {
             ValueEncoding::Raw => self.build_raw_batch(&messages)?,
-            ValueEncoding::Avro { reader_schema_json } => {
-                self.build_avro_batch(&messages, reader_schema_json)?
-            }
+            ValueEncoding::Avro {
+                reader_schema_json,
+                schema_id,
+            } => self.build_avro_batch(&messages, reader_schema_json, *schema_id)?,
             ValueEncoding::Json { schema } => self.build_json_batch(&messages, schema)?,
         };
 
@@ -255,34 +260,56 @@ impl StreamState {
     fn build_avro_batch(
         &self,
         messages: &[KafkaMessage],
-        _reader_schema_json: &str,
+        reader_schema_json: &str,
+        schema_id: u32,
     ) -> Result<RecordBatch> {
-        // Accumulate Avro payloads (strip 5-byte Confluent wire format prefix)
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(messages.len());
-        let mut metadata = MetadataAccumulator::new(messages.len());
+        let mut store = AvroSchemaStore::new_with_type(FingerprintAlgorithm::Id);
+        store
+            .set(
+                Fingerprint::Id(schema_id),
+                AvroSchema::new(reader_schema_json.to_string()),
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        let mut decoder = AvroReaderBuilder::new()
+            .with_writer_schema_store(store)
+            .with_batch_size(messages.len())
+            .build_decoder()
+            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+
+        let mut metadata = MetadataAccumulator::new(messages.len());
         for msg in messages {
             metadata.push(msg);
             if let Some(value) = &msg.value {
-                if value.len() >= 5 && value[0] == 0x00 {
-                    // Confluent wire format: magic byte (0x00) + 4-byte schema ID + payload
-                    payloads.push(value[5..].to_vec());
-                } else {
-                    payloads.push(value.clone());
+                // Feed the full Confluent-framed message (0x00 + schema_id + body)
+                // directly to the decoder -- it handles the wire format natively
+                let mut offset = 0;
+                while offset < value.len() {
+                    let consumed = decoder
+                        .decode(&value[offset..])
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    if consumed == 0 {
+                        break;
+                    }
+                    offset += consumed;
                 }
-            } else {
-                payloads.push(Vec::new());
             }
         }
 
-        // Build OCF-style framed buffer for arrow-avro Decoder
-        // For now, use the raw binary fallback and let arrow-avro handle via its Decoder
-        // TODO: wire up arrow_avro::reader::ReaderBuilder with SchemaStore for full
-        //       Confluent wire format support once arrow-avro streaming Decoder API is stable
-        //
-        // Fallback: decode via apache-avro per-record and build Arrow arrays manually
-        // For the initial implementation, return raw mode with metadata
-        self.build_raw_batch(messages)
+        let value_batch = decoder
+            .flush()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Avro decoder produced no output for non-empty messages".to_string(),
+                )
+            })?;
+
+        let mut columns: Vec<ArrayRef> = value_batch.columns().to_vec();
+        columns.extend(metadata.finish());
+
+        RecordBatch::try_new(self.schema.clone(), columns)
+            .map_err(|e| DataFusionError::ArrowError(e, None))
     }
 
     fn build_json_batch(

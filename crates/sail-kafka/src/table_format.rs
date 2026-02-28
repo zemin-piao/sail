@@ -99,6 +99,7 @@ async fn resolve_schema_and_encoding(
                     output_schema,
                     ValueEncoding::Avro {
                         reader_schema_json: registered.schema_json,
+                        schema_id: registered.schema_id,
                     },
                 ))
             }

@@ -4,6 +4,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit}
 pub enum ValueEncoding {
     Avro {
         reader_schema_json: String,
+        schema_id: u32,
     },
     Json {
         schema: ArrowSchema,
