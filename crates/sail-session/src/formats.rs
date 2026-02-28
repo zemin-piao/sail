@@ -15,6 +15,7 @@ use sail_data_source::formats::socket::SocketTableFormat;
 use sail_data_source::formats::text::TextTableFormat;
 use sail_delta_lake::DeltaTableFormat;
 use sail_iceberg::IcebergTableFormat;
+use sail_kafka::KafkaTableFormat;
 
 pub fn create_table_format_registry() -> Result<Arc<TableFormatRegistry>> {
     let registry = Arc::new(TableFormatRegistry::new());
@@ -40,6 +41,7 @@ fn register_builtin_formats(registry: &Arc<TableFormatRegistry>) -> Result<()> {
 fn register_external_formats(registry: &Arc<TableFormatRegistry>) -> Result<()> {
     DeltaTableFormat::register(registry)?;
     IcebergTableFormat::register(registry)?;
+    KafkaTableFormat::register(registry)?;
 
     // Register Python data sources
     {
