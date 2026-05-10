@@ -54,11 +54,8 @@ impl DeltaTypeConverter {
 
         if table_type == input_type {
             let is_nullable = table_field.is_nullable() || input_field.is_nullable();
-            return Ok(Field::new(
-                table_field.name(),
-                table_type.clone(),
-                is_nullable,
-            ));
+            return Ok(Field::new(table_field.name(), table_type.clone(), is_nullable)
+                .with_metadata(table_field.metadata().clone()));
         }
 
         let merged_type = match (table_type, input_type) {
@@ -181,7 +178,8 @@ impl DeltaTypeConverter {
 
         if let Some(new_type) = merged_type {
             let is_nullable = table_field.is_nullable() || input_field.is_nullable();
-            Ok(Field::new(table_field.name(), new_type, is_nullable))
+            Ok(Field::new(table_field.name(), new_type, is_nullable)
+                .with_metadata(table_field.metadata().clone()))
         } else {
             Err(DataFusionError::Plan(format!(
                 "Schema evolution failed: incompatible types for field '{}'. Cannot merge from {:?} to {:?}. Consider using overwriteSchema=true if you want to replace the schema entirely.",
@@ -298,6 +296,37 @@ mod tests {
         assert!(result.is_nullable());
         assert_eq!(result.data_type(), &DataType::Int32);
         assert_eq!(result.name(), "test");
+    }
+
+    #[test]
+    fn test_promote_field_types_preserves_table_field_metadata() {
+        use std::collections::HashMap;
+        let mut meta = HashMap::new();
+        meta.insert(
+            "delta.columnMapping.physicalName".to_string(),
+            "col-abc123".to_string(),
+        );
+        let table_field =
+            Field::new("region", DataType::Utf8, false).with_metadata(meta.clone());
+        let input_field = Field::new("region", DataType::Utf8, false);
+
+        // Same type: early-return path must preserve metadata
+        let result = DeltaTypeConverter::promote_field_types(&table_field, &input_field).unwrap();
+        assert_eq!(
+            result.metadata().get("delta.columnMapping.physicalName"),
+            Some(&"col-abc123".to_string()),
+            "physicalName metadata must be preserved when types match"
+        );
+
+        // Promoted type: general path must also preserve metadata
+        let input_wide = Field::new("region", DataType::LargeUtf8, false);
+        let result2 =
+            DeltaTypeConverter::promote_field_types(&table_field, &input_wide).unwrap();
+        assert_eq!(
+            result2.metadata().get("delta.columnMapping.physicalName"),
+            Some(&"col-abc123".to_string()),
+            "physicalName metadata must be preserved after type promotion"
+        );
     }
 
     #[test]
