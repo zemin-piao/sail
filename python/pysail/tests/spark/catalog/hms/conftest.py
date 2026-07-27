@@ -352,7 +352,10 @@ _SPARK_VERSION = _pyspark.__version__
 _SPARK_MAJOR, _SPARK_MINOR_PART = _SPARK_VERSION.split(".")[:2]
 _SCALA_BINARY = "2.12" if _SPARK_MAJOR == "3" else "2.13"
 _SPARK_MINOR = f"{_SPARK_MAJOR}.{_SPARK_MINOR_PART}"
-_DELTA_SPARK_PACKAGE = delta_spark_maven_coordinate(_SPARK_VERSION)
+try:
+    _DELTA_SPARK_PACKAGE = delta_spark_maven_coordinate(_SPARK_VERSION)
+except RuntimeError as error:
+    pytest.skip(reason=str(error), allow_module_level=True)
 # Avro is a built-in but *external* datasource in Spark 2.4+: the runtime jar must
 # be on the classpath for `USING AVRO`.
 _AVRO_SPARK_PACKAGE = f"org.apache.spark:spark-avro_{_SCALA_BINARY}:{_SPARK_VERSION}"
