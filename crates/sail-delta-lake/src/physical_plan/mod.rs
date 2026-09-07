@@ -21,10 +21,10 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, LexRequirement, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use datafusion_physical_expr::expressions::{Column as PhysicalColumn, lit};
+use sail_physical_plan::repartition::ExplicitRepartitionExec;
 
 mod action_schema;
 mod commit_exec;
@@ -171,12 +171,24 @@ pub fn create_sort(
 }
 
 /// Create a `RepartitionExec` instance for Delta Lake data repartitioning.
+///
+/// Writer parallelism is independent of Delta partition cardinality: upstream partitions are
+/// preserved up to the configured limit and redistributed when they exceed it. Writers use unique
+/// file names, and the following local sort groups table partitions within each task. This can
+/// produce one final partial file per task for every table partition the task touches.
 pub fn create_repartition(
     input: Arc<dyn ExecutionPlan>,
     num_partitions: usize,
-) -> Result<Arc<RepartitionExec>> {
-    let partitioning = Partitioning::RoundRobinBatch(num_partitions.max(1));
-    Ok(Arc::new(RepartitionExec::try_new(input, partitioning)?))
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let num_partitions = num_partitions.max(1);
+    if input.output_partitioning().partition_count() <= num_partitions {
+        Ok(input)
+    } else {
+        Ok(Arc::new(ExplicitRepartitionExec::new(
+            input,
+            Partitioning::RoundRobinBatch(num_partitions),
+        )))
+    }
 }
 
 pub(crate) fn current_timestamp_millis() -> Result<i64> {
@@ -195,7 +207,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn partitioned_writes_use_round_robin_execution_partitions() {
+    fn delta_writes_do_not_hash_by_table_partitions() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int64, false),
             Field::new("day", DataType::Utf8, false),
@@ -204,9 +216,7 @@ mod tests {
 
         let repartition = create_repartition(input, 4).unwrap();
 
-        assert_eq!(
-            repartition.partitioning(),
-            &Partitioning::RoundRobinBatch(4)
-        );
+        assert!(repartition.is::<EmptyExec>());
+        assert_eq!(repartition.output_partitioning().partition_count(), 1);
     }
 }

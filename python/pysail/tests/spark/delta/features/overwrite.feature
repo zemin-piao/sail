@@ -50,7 +50,13 @@ Feature: Delta Lake Overwrite
           (6, 'A', 200)
         AS tab(id, category, value)
         """
-      Then delta log latest commit info matches snapshot
+      Then delta log latest commit info contains
+        | path                              | value     |
+        | operation                         | WRITE     |
+        | operationParameters.mode          | Overwrite |
+        | operationMetrics.numOutputRows    | 4         |
+        | operationMetrics.numRemovedFiles  | 1         |
+        | operationMetrics.numTouchedRows   | 4         |
       When query
         """
         SELECT id, category, value FROM delta_overwrite_basic ORDER BY id
@@ -85,7 +91,13 @@ Feature: Delta Lake Overwrite
           (11, 'D', 111)
         AS tab(id, category, value)
         """
-      Then delta log latest commit info matches snapshot
+      Then delta log latest commit info contains
+        | path                              | value     |
+        | operation                         | WRITE     |
+        | operationParameters.mode          | Overwrite |
+        | operationMetrics.numOutputRows    | 2         |
+        | operationMetrics.numRemovedFiles  | 1         |
+        | operationMetrics.numTouchedRows   | 4         |
       When query
         """
         SELECT id, category, value FROM delta_overwrite_basic ORDER BY id

@@ -126,6 +126,17 @@ fn replay_output_schema(
     Arc::new(Schema::new(fields))
 }
 
+pub fn prepare_delta_writer_input(
+    input: Arc<dyn ExecutionPlan>,
+    partition_columns: &[String],
+    target_partitions: usize,
+    sort_order: Option<LexRequirement>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let plan = create_projection(input, partition_columns.to_vec())?;
+    let plan = create_repartition(plan, target_partitions)?;
+    Ok(create_sort(plan, partition_columns.to_vec(), sort_order)?)
+}
+
 pub fn build_standard_write_layers(
     ctx: &PlannerContext<'_>,
     input: Arc<dyn ExecutionPlan>,
@@ -133,10 +144,12 @@ pub fn build_standard_write_layers(
     sort_order: Option<LexRequirement>,
     original_schema: SchemaRef,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let target_partitions = ctx.session().config().target_partitions().max(1);
-    let plan = create_projection(Arc::clone(&input), ctx.partition_columns().to_vec())?;
-    let plan = create_repartition(plan, target_partitions)?;
-    let plan = create_sort(plan, ctx.partition_columns().to_vec(), sort_order)?;
+    let plan = prepare_delta_writer_input(
+        Arc::clone(&input),
+        ctx.partition_columns(),
+        ctx.session().config().target_partitions(),
+        sort_order,
+    )?;
 
     let writer_schema = plan.schema();
     let write_context = ctx.prepare_write_context(&writer_schema, sink_mode, None)?;
@@ -689,4 +702,58 @@ async fn build_log_replay_pipeline_with_files(
 
     // Replay now outputs the extracted payload columns directly (replay keys are stripped).
     Ok(replay)
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use sail_physical_plan::repartition::ExplicitRepartitionExec;
+
+    use super::*;
+
+    fn input_with_partitions(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("day", DataType::Utf8, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        Arc::new(
+            RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(partitions)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn writer_input_parallelism_is_bounded_by_target_partitions() {
+        let input = input_with_partitions(10);
+        let plan = prepare_delta_writer_input(input, &["day".to_string()], 4, None).unwrap();
+
+        assert_eq!(plan.output_partitioning().partition_count(), 4);
+        let sort = plan.downcast_ref::<SortExec>().unwrap();
+        assert!(sort.preserve_partitioning());
+
+        let repartition = sort
+            .input()
+            .downcast_ref::<ExplicitRepartitionExec>()
+            .unwrap();
+        assert!(matches!(
+            repartition.properties().output_partitioning(),
+            Partitioning::RoundRobinBatch(4)
+        ));
+        assert_eq!(
+            repartition.input().output_partitioning().partition_count(),
+            10
+        );
+    }
+
+    #[test]
+    fn writer_input_parallelism_has_a_minimum_of_one() {
+        let plan =
+            prepare_delta_writer_input(input_with_partitions(10), &["day".to_string()], 0, None)
+                .unwrap();
+
+        assert_eq!(plan.output_partitioning().partition_count(), 1);
+    }
 }
