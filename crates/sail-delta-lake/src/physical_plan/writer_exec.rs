@@ -500,28 +500,7 @@ impl ExecutionPlan for DeltaWriterExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.partition_columns.is_empty() {
-            // Upstream repartitioning controls file counts and small-file behavior.
-            return vec![Distribution::UnspecifiedDistribution];
-        }
-
-        // For partitioned tables, require grouping by the partition key so that each task can
-        // write its partitions correctly without opening many writers concurrently.
-        //
-        // TODO(optimizer): Reduce the cost of meeting this distribution requirement.
-        let mut exprs: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>> =
-            Vec::with_capacity(self.partition_columns.len());
-        for name in &self.partition_columns {
-            let idx = match self.input.schema().index_of(name) {
-                Ok(i) => i,
-                Err(_) => return vec![Distribution::UnspecifiedDistribution],
-            };
-            exprs.push(Arc::new(
-                datafusion_physical_expr::expressions::Column::new(name, idx),
-            ));
-        }
-
-        vec![Distribution::HashPartitioned(exprs)]
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {

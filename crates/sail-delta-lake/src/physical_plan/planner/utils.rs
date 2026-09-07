@@ -135,7 +135,7 @@ pub fn build_standard_write_layers(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let target_partitions = ctx.session().config().target_partitions().max(1);
     let plan = create_projection(Arc::clone(&input), ctx.partition_columns().to_vec())?;
-    let plan = create_repartition(plan, ctx.partition_columns().to_vec(), target_partitions)?;
+    let plan = create_repartition(plan, target_partitions)?;
     let plan = create_sort(plan, ctx.partition_columns().to_vec(), sort_order)?;
 
     let writer_schema = plan.schema();

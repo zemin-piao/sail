@@ -173,40 +173,9 @@ pub fn create_sort(
 /// Create a `RepartitionExec` instance for Delta Lake data repartitioning.
 pub fn create_repartition(
     input: Arc<dyn ExecutionPlan>,
-    partition_columns: Vec<String>,
     num_partitions: usize,
 ) -> Result<Arc<RepartitionExec>> {
-    let num_partitions = num_partitions.max(1);
-    let partitioning = if partition_columns.is_empty() {
-        // No partition columns, ensure some parallelism
-        Partitioning::RoundRobinBatch(num_partitions)
-    } else {
-        // Since create_projection moves partition columns to the end, we can rely on their positions.
-        let schema = input.schema();
-        let num_cols = schema.fields().len();
-        let num_part_cols = partition_columns.len();
-
-        // TODO: Investigate repartitioning behavior for "bucketing" with overlapping partition columns
-        // Current implementation may not handle the desired output structure where multiple writers
-        // can create files within the same partition directory. For example:
-        // year=2024/
-        //     part-00000.parquet (created by writer 1)
-        //     part-00001.parquet (created by writer 2)
-        //     part-00002.parquet (created by writer 3)
-        //     part-00003.parquet (created by writer 4)
-        // year=2025/
-        //     part-00000.parquet (created by writer 1)
-        //     part-00001.parquet (created by writer 2)
-        //     part-00002.parquet (created by writer 3)
-        //     part-00003.parquet (created by writer 4)
-        let partition_exprs: Vec<Arc<dyn PhysicalExpr>> = (num_cols - num_part_cols..num_cols)
-            .zip(partition_columns.iter())
-            .map(|(idx, name)| Arc::new(PhysicalColumn::new(name, idx)) as Arc<dyn PhysicalExpr>)
-            .collect();
-
-        Partitioning::Hash(partition_exprs, num_partitions)
-    };
-
+    let partitioning = Partitioning::RoundRobinBatch(num_partitions.max(1));
     Ok(Arc::new(RepartitionExec::try_new(input, partitioning)?))
 }
 
@@ -215,4 +184,29 @@ pub(crate) fn current_timestamp_millis() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    use super::*;
+
+    #[test]
+    fn partitioned_writes_use_round_robin_execution_partitions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("day", DataType::Utf8, false),
+        ]));
+        let input = Arc::new(EmptyExec::new(schema));
+
+        let repartition = create_repartition(input, 4).unwrap();
+
+        assert_eq!(
+            repartition.partitioning(),
+            &Partitioning::RoundRobinBatch(4)
+        );
+    }
 }

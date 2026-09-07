@@ -1,7 +1,16 @@
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
+from pysail.testing.spark.session import spark_connect_server, spark_session_factory
+from pyspark.sql import functions as F
 from pyspark.sql.types import Row
+
+
+@pytest.fixture(scope="module")
+def parallel_spark():
+    with spark_connect_server(envs={"SAIL_EXECUTION__DEFAULT_PARALLELISM": "4"}) as server:
+        with spark_session_factory(server.remote) as sessions:
+            yield sessions.create()
 
 
 @pytest.fixture(scope="module")
@@ -56,6 +65,18 @@ def test_delta_partitioning_by_single_column(spark, tmp_path):
 
     filtered_df_gt = spark.read.format("delta").load(delta_table_path).filter("year > 2025")
     assert filtered_df_gt.count() == 2, "GREATER THAN filter should return 2 records for year>2025"  # noqa: PLR2004
+
+
+def test_delta_constant_partition_uses_multiple_writers(parallel_spark, tmp_path):
+    delta_path = tmp_path / "constant_partitioned_delta_table"
+    row_count = 32_768
+    df = parallel_spark.range(0, row_count, 1, 4).withColumn("day", F.lit("2026-09-06"))
+
+    df.write.format("delta").mode("overwrite").partitionBy("day").save(str(delta_path))
+
+    data_files = list((delta_path / "day=2026-09-06").glob("*.parquet"))
+    assert len(data_files) > 1
+    assert parallel_spark.read.format("delta").load(str(delta_path)).count() == row_count
 
 
 def test_delta_partitioning_creates_correct_directory_structure(spark, delta_test_data, tmp_path):
