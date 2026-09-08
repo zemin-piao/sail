@@ -38,12 +38,10 @@ Feature: Delta Lake operationMetrics in commitInfo
         INSERT INTO delta_op_metrics_write REPLACE WHERE id >= 2
         VALUES (5,'x'),(6,'y')
         """
-      Then delta log latest commit info contains
-        | path                              | value |
-        | operation                         | WRITE |
-        | operationMetrics.numOutputRows    | 3     |
-        | operationMetrics.numRemovedFiles  | 1     |
-        | operationMetrics.numTouchedRows   | 3     |
+      Then delta log latest commit info matches snapshot for paths
+        | path             |
+        | operation        |
+        | operationMetrics |
 
   Rule: DELETE operationMetrics (Copy-on-Write)
 
@@ -181,16 +179,10 @@ Feature: Delta Lake operationMetrics in commitInfo
         WHEN NOT MATCHED BY SOURCE AND t.flag = 'source_delete' THEN DELETE
         WHEN NOT MATCHED THEN INSERT *
         """
-      Then delta log latest commit info contains
-        | path                                                    | value |
-        | operation                                               | MERGE |
-        | operationMetrics.numOutputRows                          | 4     |
-        | operationMetrics.numSourceRows                          | 3     |
-        | operationMetrics.numTargetRowsCopied                    | 1     |
-        | operationMetrics.numTargetRowsDeleted                   | 2     |
-        | operationMetrics.numTargetRowsInserted                  | 1     |
-        | operationMetrics.numTargetRowsUpdated                   | 2     |
-        | operationMetrics.numTouchedRows                         | 5     |
+      Then delta log latest commit info matches snapshot for paths
+        | path             |
+        | operation        |
+        | operationMetrics |
 
     Scenario: Conditional MERGE counts source rows without actions
       Given statement
@@ -211,15 +203,10 @@ Feature: Delta Lake operationMetrics in commitInfo
         WHEN MATCHED AND t.flag = 'matched_update' THEN UPDATE SET value = s.value
         WHEN NOT MATCHED AND s.flag = 'insert' THEN INSERT *
         """
-      Then delta log latest commit info contains
-        | path                                  | value |
-        | operation                             | MERGE |
-        | operationMetrics.numOutputRows        | 6     |
-        | operationMetrics.numSourceRows        | 4     |
-        | operationMetrics.numTargetRowsCopied  | 4     |
-        | operationMetrics.numTargetRowsInserted | 1     |
-        | operationMetrics.numTargetRowsUpdated | 1     |
-        | operationMetrics.numTouchedRows       | 5     |
+      Then delta log latest commit info matches snapshot for paths
+        | path             |
+        | operation        |
+        | operationMetrics |
 
     Scenario: Insert-only MERGE fast-appends without removing files
       Given statement
@@ -269,17 +256,10 @@ Feature: Delta Lake operationMetrics in commitInfo
           UPDATE SET value = concat(t.value, '_stale')
         WHEN NOT MATCHED BY SOURCE AND t.flag = 'source_delete' THEN DELETE
         """
-      Then delta log latest commit info contains
-        | path                                                    | value |
-        | operation                                               | MERGE |
-        | operationMetrics.numOutputRows                          | 4     |
-        | operationMetrics.numSourceRows                          | 0     |
-        | operationMetrics.numTargetRowsCopied                    | 3     |
-        | operationMetrics.numTargetRowsDeleted                   | 1     |
-        | operationMetrics.numTargetRowsNotMatchedBySourceDeleted | 1     |
-        | operationMetrics.numTargetRowsNotMatchedBySourceUpdated | 1     |
-        | operationMetrics.numTargetRowsUpdated                   | 1     |
-        | operationMetrics.numTouchedRows                         | 5     |
+      Then delta log latest commit info matches snapshot for paths
+        | path             |
+        | operation        |
+        | operationMetrics |
 
   Rule: MERGE operationMetrics (Merge-on-Read with deletion vectors)
 

@@ -569,6 +569,7 @@ Feature: Delta Lake Merge
           INSERT (id, category, amount, note)
           VALUES (s.id, s.category, s.amount, concat('default_', s.note))
         """
+      Then delta log latest commit info matches snapshot
       Then delta log latest commit info contains
         | path                                               | value                   |
         | operation                                          | "MERGE"                 |

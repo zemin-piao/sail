@@ -503,6 +503,14 @@ impl ExecutionPlan for DeltaWriterExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // Writer parallelism follows the input plan. Letting `EnforceDistribution` add a
+        // round-robin repartition just for the writer would make the file layout and the
+        // `operationMetrics` file/byte counters depend on batch arrival order. Operators that do
+        // benefit from partitioning still get it, so upstream parallelism is unaffected.
+        vec![false]
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         if self.partition_columns.is_empty() {
             return vec![None];

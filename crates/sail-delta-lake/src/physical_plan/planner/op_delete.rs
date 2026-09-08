@@ -140,8 +140,7 @@ pub async fn build_delete_plan(
     let negated_condition = Arc::new(NotExpr::new(adapted_condition));
     let filter_exec: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(negated_condition, scan_exec)?);
-    let writer_input =
-        prepare_delta_writer_input(filter_exec, &partition_columns, target_partitions, None)?;
+    let writer_input = prepare_delta_writer_input(filter_exec, &partition_columns, None)?;
 
     let operation = Some(DeltaOperation::Delete {
         predicate: condition.source,

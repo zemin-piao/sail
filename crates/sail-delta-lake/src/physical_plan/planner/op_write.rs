@@ -79,12 +79,7 @@ async fn build_full_overwrite_plan(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let input_schema = input.schema();
 
-    let plan = prepare_delta_writer_input(
-        input,
-        ctx.partition_columns(),
-        ctx.session().config().target_partitions(),
-        sort_order,
-    )?;
+    let plan = prepare_delta_writer_input(input, ctx.partition_columns(), sort_order)?;
 
     let writer_schema = plan.schema();
     let write_context =
@@ -190,12 +185,7 @@ async fn build_overwrite_if_plan(
 
     let (aligned_new, aligned_old) = align_schemas_for_union(Arc::clone(&input), old_data_plan)?;
     let union_plan = UnionExec::try_new(vec![aligned_new, aligned_old])?;
-    let union_plan = prepare_delta_writer_input(
-        union_plan,
-        ctx.partition_columns(),
-        ctx.session().config().target_partitions(),
-        sort_order,
-    )?;
+    let union_plan = prepare_delta_writer_input(union_plan, ctx.partition_columns(), sort_order)?;
 
     let input_schema = input.schema();
     let operation_override = Some(DeltaOperation::Write {
