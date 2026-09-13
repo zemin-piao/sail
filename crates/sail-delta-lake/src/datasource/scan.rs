@@ -174,6 +174,37 @@ pub(crate) fn file_scan_projection_for_schema(
         .collect()
 }
 
+/// Spread `files` across up to `target_partitions` file groups.
+///
+/// One [`FileGroup`] becomes one execution partition, so the group count is the scan's
+/// parallelism. Grouping by partition value instead — as this previously did — tied that
+/// parallelism to the number of distinct Hive partitions selected, which collapsed a
+/// single-partition read onto one task no matter how many files it covered or how many cores
+/// were available. Delta's deletion-vector path already round-robins its `Add` actions the same
+/// way (see `build_eager_adds_input`).
+///
+/// Files are distributed round-robin in input order, so plans stay deterministic. Groups can
+/// still be uneven when file sizes are skewed; balancing by `size` would improve that, at the
+/// cost of reordering files within the scan.
+///
+/// Always returns at least one group: DataFusion sanity checks require a scan to report at
+/// least one partition even when every file was pruned away.
+/// See <https://github.com/apache/datafusion/issues/11322>.
+fn split_files_into_groups(
+    files: Vec<PartitionedFile>,
+    target_partitions: usize,
+) -> Vec<FileGroup> {
+    let group_count = target_partitions.max(1).min(files.len());
+    if group_count <= 1 {
+        return vec![FileGroup::from(files)];
+    }
+    let mut groups = vec![Vec::new(); group_count];
+    for (index, file) in files.into_iter().enumerate() {
+        groups[index % group_count].push(file);
+    }
+    groups.into_iter().map(FileGroup::from).collect()
+}
+
 /// Build a FileScanConfig from pruned files and scan configuration
 pub fn build_file_scan_config(
     snapshot: &DeltaSnapshot,
@@ -198,11 +229,10 @@ pub fn build_file_scan_config(
         snapshot.effective_column_mapping_mode(),
     );
 
-    // Build file groups by partition values
-    let mut file_groups: HashMap<
-        Vec<datafusion::common::scalar::ScalarValue>,
-        Vec<PartitionedFile>,
-    > = HashMap::new();
+    // Collect the scanned files in a single deterministic list. They are spread across file
+    // groups below; each `PartitionedFile` carries its own partition values, so a group does
+    // not need to be homogeneous in them.
+    let mut scanned_files: Vec<PartitionedFile> = Vec::with_capacity(files.len());
 
     // Collect per-file statistics while building `PartitionedFile`s so we can reuse them to
     // produce chunk-local table statistics without re-parsing JSON.
@@ -246,20 +276,15 @@ pub fn build_file_scan_config(
                 ));
         }
 
-        file_groups
-            .entry(part.partition_values.clone())
-            .or_default()
-            .push(part);
+        scanned_files.push(part);
     }
 
     // Rewrite file paths with table location prefix
-    file_groups.iter_mut().for_each(|(_, files)| {
-        files.iter_mut().for_each(|file| {
-            file.object_meta.location = rewrite_data_file_location(
-                Path::from(log_store.config().location.path()),
-                file.object_meta.location.clone(),
-            );
-        });
+    scanned_files.iter_mut().for_each(|file| {
+        file.object_meta.location = rewrite_data_file_location(
+            Path::from(log_store.config().location.path()),
+            file.object_meta.location.clone(),
+        );
     });
 
     // Build table partition columns schema
@@ -400,23 +425,17 @@ pub fn build_file_scan_config(
 
     // Build the final FileScanConfig
     let object_store_url = create_object_store_url(&log_store.config().location)?;
-    let mut file_groups: Vec<FileGroup> = file_groups.into_values().map(FileGroup::from).collect();
-    // If all files were filtered out, we still need to emit at least one partition
-    // to pass datafusion sanity checks.
-    // See https://github.com/apache/datafusion/issues/11322
-    if file_groups.is_empty() {
-        file_groups = vec![FileGroup::from(vec![])];
-    }
-    if let Some(sort_order) = &params.sort_order {
-        let all_have_stats = file_groups
-            .iter()
-            .flat_map(FileGroup::iter)
-            .all(|f| f.has_statistics());
-        if all_have_stats {
-            file_groups =
-                FileScanConfig::split_groups_by_statistics(&file_schema, &file_groups, sort_order)?;
-        }
-    }
+    let all_have_stats = scanned_files.iter().all(|file| file.has_statistics());
+    let file_groups = match &params.sort_order {
+        // An ordered scan must keep the ordering-preserving split, which decides group
+        // membership from file statistics rather than from a parallelism target.
+        Some(sort_order) if all_have_stats => FileScanConfig::split_groups_by_statistics(
+            &file_schema,
+            &[FileGroup::from(scanned_files)],
+            sort_order,
+        )?,
+        _ => split_files_into_groups(scanned_files, session.config().target_partitions()),
+    };
 
     let file_scan_config = FileScanConfigBuilder::new(object_store_url, file_source)
         .with_file_groups(file_groups)
@@ -801,11 +820,11 @@ mod tests {
         .expect("file scan config")
     }
 
-    /// Scan parallelism currently tracks the number of distinct Hive partition values, not the
-    /// number of files and not `target_partitions`. This documents the mechanism behind
-    /// `single_hive_partition_scan_uses_target_partitions`.
+    /// Scan parallelism must follow `target_partitions`, not how the selected files happen to
+    /// be spread over Hive partitions. Group membership is allowed to mix partition values
+    /// because each `PartitionedFile` carries its own.
     #[test]
-    fn scan_parallelism_tracks_partition_count_not_file_count() {
+    fn scan_parallelism_is_independent_of_partition_count() {
         // Same 400 files, same target_partitions, only the partition-value spread differs.
         for distinct_partitions in [1usize, 4, 40] {
             let adds = (0..400usize)
@@ -828,8 +847,33 @@ mod tests {
             let config = one_partition_scan_config(&adds, 200);
             assert_eq!(
                 config.file_groups.len(),
-                distinct_partitions,
-                "file group count follows distinct partition values, not target_partitions"
+                200,
+                "file group count must follow target_partitions, but {distinct_partitions} \
+                 distinct partition value(s) produced {} group(s)",
+                config.file_groups.len()
+            );
+            let total_files: usize = config.file_groups.iter().map(|group| group.len()).sum();
+            assert_eq!(total_files, 400, "every file must still be scanned");
+        }
+    }
+
+    /// Fewer files than `target_partitions` must not create empty groups, and a single file
+    /// must not be split. Empty inputs still need one group for DataFusion's sanity checks.
+    #[test]
+    fn scan_file_groups_are_bounded_by_file_count() {
+        for file_count in [0usize, 1, 7] {
+            let adds = adds_in_one_partition(file_count);
+            let config = one_partition_scan_config(&adds, 200);
+
+            assert_eq!(
+                config.file_groups.len(),
+                file_count.max(1),
+                "{file_count} file(s) should produce {} group(s)",
+                file_count.max(1)
+            );
+            assert!(
+                config.file_groups.iter().all(|group| group.len() <= 1),
+                "no group should hold more than one file when files are scarce"
             );
         }
     }
