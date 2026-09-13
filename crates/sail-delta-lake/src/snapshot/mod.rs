@@ -447,6 +447,30 @@ impl DeltaSnapshot {
         self.adds.as_ref()
     }
 
+    /// Build a minimal snapshot around a metadata/add pair, for tests that exercise scan
+    /// planning without materializing a table on an object store.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(metadata: Metadata, adds: Vec<Add>) -> DeltaResult<Self> {
+        let table_properties = TableProperties::from(metadata.configuration().iter());
+        let arrow_schema = Arc::new(metadata.parse_schema_arrow()?);
+        Ok(Self {
+            version: 0,
+            table_url: Url::parse("memory:///")
+                .map_err(|e| DeltaTableError::generic(format!("invalid test table url: {e}")))?,
+            config: DeltaSnapshotConfig::default(),
+            protocol: Protocol::default(),
+            metadata,
+            table_properties,
+            arrow_schema,
+            adds: Arc::new(adds),
+            removes: Arc::new(Vec::new()),
+            app_txns: Arc::new(HashMap::new()),
+            domain_metadata: Arc::new(HashMap::new()),
+            commit_timestamps: Arc::new(BTreeMap::new()),
+            files_batch: OnceCell::new(),
+        })
+    }
+
     pub(crate) fn shared_adds(&self) -> Arc<Vec<Add>> {
         Arc::clone(&self.adds)
     }

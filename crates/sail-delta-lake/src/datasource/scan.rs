@@ -718,12 +718,140 @@ mod tests {
     use object_store::path::Path;
 
     use super::{
-        add_column_statistics, map_statistics_to_schema,
+        add_column_statistics, build_file_scan_config, map_statistics_to_schema,
         map_statistics_to_schema_with_name_mapping, rewrite_data_file_location,
         sanitize_statistics_for_schema, stats_for_add,
     };
     use crate::conversion::ScalarConverter;
     use crate::spec::Add;
+
+    /// Build `count` data files that all live in the same Hive partition (`p=1`).
+    fn adds_in_one_partition(count: usize) -> Vec<Add> {
+        (0..count)
+            .map(|index| Add {
+                path: format!("p=1/part-{index:05}.parquet"),
+                partition_values: HashMap::from([("p".to_string(), Some("1".to_string()))]),
+                size: 16 * 1024 * 1024,
+                modification_time: 0,
+                data_change: true,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn one_partition_scan_config(
+        adds: &[Add],
+        target_partitions: usize,
+    ) -> datafusion::datasource::physical_plan::FileScanConfig {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+        use object_store::ObjectStore;
+        use object_store::memory::InMemory;
+        use url::Url;
+
+        use crate::StorageConfig;
+        use crate::datasource::DeltaScanConfig;
+        use crate::datasource::scan::{FileScanParams, TableStatsMode};
+        use crate::delta_log::default_logstore;
+        use crate::snapshot::DeltaSnapshot;
+        use crate::spec::{DataType as DeltaDataType, Metadata, StructField, StructType};
+
+        #[expect(clippy::expect_used)]
+        let schema = StructType::try_new(vec![
+            StructField::new("p", DeltaDataType::STRING, true),
+            StructField::new("v", DeltaDataType::LONG, true),
+        ])
+        .expect("schema");
+        #[expect(clippy::expect_used)]
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["p".to_string()], 0, HashMap::new())
+                .expect("metadata");
+        #[expect(clippy::expect_used)]
+        let snapshot = DeltaSnapshot::new_for_test(metadata, adds.to_vec()).expect("snapshot");
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        #[expect(clippy::expect_used)]
+        let url = Url::parse("memory:///").expect("url");
+        let log_store = default_logstore(store.clone(), store, &url, &StorageConfig);
+
+        let session = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(target_partitions))
+            .with_default_features()
+            .build();
+
+        // Non-partition columns only: this is the schema of the data inside each parquet file.
+        let file_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+
+        #[expect(clippy::expect_used)]
+        build_file_scan_config(
+            &snapshot,
+            &log_store,
+            adds,
+            &DeltaScanConfig::default(),
+            FileScanParams {
+                projection: None,
+                limit: None,
+                pushdown_filter: None,
+                sort_order: None,
+                table_stats_mode: TableStatsMode::AddsOnly,
+            },
+            &session,
+            file_schema,
+        )
+        .expect("file scan config")
+    }
+
+    /// Scan parallelism currently tracks the number of distinct Hive partition values, not the
+    /// number of files and not `target_partitions`. This documents the mechanism behind
+    /// `single_hive_partition_scan_uses_target_partitions`.
+    #[test]
+    fn scan_parallelism_tracks_partition_count_not_file_count() {
+        // Same 400 files, same target_partitions, only the partition-value spread differs.
+        for distinct_partitions in [1usize, 4, 40] {
+            let adds = (0..400usize)
+                .map(|index| {
+                    let partition = index % distinct_partitions;
+                    Add {
+                        path: format!("p={partition}/part-{index:05}.parquet"),
+                        partition_values: HashMap::from([(
+                            "p".to_string(),
+                            Some(partition.to_string()),
+                        )]),
+                        size: 16 * 1024 * 1024,
+                        modification_time: 0,
+                        data_change: true,
+                        ..Default::default()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let config = one_partition_scan_config(&adds, 200);
+            assert_eq!(
+                config.file_groups.len(),
+                distinct_partitions,
+                "file group count follows distinct partition values, not target_partitions"
+            );
+        }
+    }
+
+    /// Reading a single Hive partition must still spread its files across execution
+    /// partitions. Grouping files solely by partition value collapses the scan to one
+    /// `FileGroup`, so the whole read runs on a single task regardless of `target_partitions`.
+    #[test]
+    fn single_hive_partition_scan_uses_target_partitions() {
+        let adds = adds_in_one_partition(400);
+        let config = one_partition_scan_config(&adds, 200);
+
+        let total_files: usize = config.file_groups.iter().map(|group| group.len()).sum();
+        assert_eq!(total_files, 400, "every file must still be scanned");
+        assert_eq!(
+            config.file_groups.len(),
+            200,
+            "400 files in one Hive partition should spread over target_partitions groups, \
+             got {} group(s)",
+            config.file_groups.len()
+        );
+    }
 
     #[test]
     fn test_scalar_from_json_null_returns_typed_null() {
