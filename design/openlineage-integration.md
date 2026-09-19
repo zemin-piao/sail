@@ -37,9 +37,9 @@ Sail is unusually well positioned for OpenLineage:
 
 The recommendation is a new `sail-lineage` crate plus a `LineageService` session extension,
 with explicit lifecycle calls in the Spark Connect and Flight SQL frontends. Table-level
-lineage is straightforward. Two things are not: **event volume** (§4) is the constraint most
-likely to make the feature unusable in practice, and **column-level lineage** (§6) is blocked
-on an internal naming detail.
+lineage is straightforward. **Event volume** (§4) is the constraint most likely to make the
+feature unusable in practice. **Column-level lineage** (§6) looked like it was blocked on an
+internal naming detail; comparing against the Spark integration (§9) shows it mostly is not.
 
 ---
 
@@ -315,7 +315,7 @@ needs. A linear scan over ~13 extractors per plan node is not worth optimizing.
 
 **Iteration order must be deterministic.** `TableFormatRegistry` stores a `HashMap`, which is
 fine for keyed lookup but not for a first-match scan: nondeterministic order would make the
-golden-file tests in §10.8 flaky and could silently change which extractor claims a node
+golden-file tests in §11.8 flaky and could silently change which extractor claims a node
 between runs. Hence the ordered `Vec`, with the name used only for dedup and override.
 
 **Conflict semantics.** First match wins. Two extractors claiming the same node is a bug, not
@@ -354,11 +354,13 @@ Two unsolved cases, both real:
 
 - **Multi-path and glob listing sources.** `ListingTableSource` holds `Vec<ListingTableUrl>`,
   and a `ListingTableUrl` can be a glob. What is the dataset name for
-  `s3://bucket/data/year=*/`? OpenLineage has no good answer. Candidates: the longest
-  non-glob prefix (loses precision, but stable and joins correctly with a write to the same
-  root), or one dataset per resolved path (explodes cardinality). Prefix is probably right;
-  it needs a decision, and the glob pattern should go in a `sail_pathPattern` custom facet so
-  the information is not lost.
+  `s3://bucket/data/year=*/`? The engine cannot know whether `year=2024/` is part of the
+  dataset's identity or a partition of it — but the user can. Spark solves this with
+  `spark.openlineage.dataset.removePath.pattern`, a user-supplied regex that strips components
+  from dataset paths (§9.2). Adopt the same mechanism as `lineage.dataset.remove_path_pattern`,
+  defaulting to the longest non-glob prefix when unset, since that is stable and joins
+  correctly with a write to the same root. The glob pattern itself goes in a `sail_pathPattern`
+  custom facet so the information is not lost.
 - **URI normalization.** The same physical dataset reached as `s3a://b/p`, `s3://b/p` and
   `s3://b/p/` must produce one identity, or the lineage graph silently forks. `naming.rs`
   needs a canonicalization pass (scheme aliasing, trailing-slash stripping, no leading slash
@@ -400,7 +402,7 @@ they are Sail implementation details and would leak into user-facing catalogs ot
 
 ---
 
-## 6. Column-level lineage: the blocker
+## 6. Column-level lineage
 
 `PlanResolver` renames **every** field to an opaque internal ID of the form `#0`, `#1`, `#2`
 (`crates/sail-plan/src/resolver/state.rs:120`) to avoid name collisions during resolution.
@@ -412,22 +414,66 @@ reapplied only at the very end:
 - for everything else — never. The optimized logical plan that a lineage extractor would walk
   is entirely `#N`.
 
-So an extractor over the final logical plan can correctly compute the *graph* (`#7` derives
-from `#3` and `#4`), and can name the leaves (a `TableScan`'s schema still has real column
-names before the rename projection) and the roots (`NamedPlan.fields`), but it cannot name
-intermediate columns without the mapping.
+An earlier draft of this note called that a blocker and built a plan around exporting the
+`#N → name` map. Comparing against Spark's integration (§9) shows the premise was wrong.
 
-### 6.1 Getting the mapping out
+### 6.1 The `#N` names mostly do not matter
 
-**Recommended: stash it in the session extension, only when lineage is enabled.**
-When `lineage.enabled` is set, `PlanResolver` writes the `#N → name` map into
-`LineageService`, keyed by operation ID; the extractor reads it there and drops it when the
-run reaches a terminal state. Zero allocation when the feature is off, no core type widened,
-no signature changed. The cost is a side channel — the map travels out-of-band rather than
-with the plan it describes — which is less elegant but matches how `JobService` and
-`ActivityTracker` already carry per-session state.
+Spark has the identical situation. Every expression in a Spark logical plan carries an opaque
+`ExprId`, and Spark's `ColumnLevelLineageBuilder` never resolves intermediate ones to names.
+It does not need to, because the `columnLineage` facet does not carry them: the facet maps
+each **output field name** to a list of **input fields**, each qualified by its dataset
+(`{namespace, name, field}`). Everything between the leaves and the root is graph structure,
+not names.
 
-**Alternative: widen `NamedPlan` and `resolve_and_execute_plan`.**
+So the two places names are needed are exactly the two places Sail already has them:
+
+- **Leaves.** Spark's `InputFieldsCollector` walks relation nodes and pairs each `ExprId` with
+  a `(DatasetIdentifier, field name)`. Sail's equivalent is easier: `resolve_table_source_with_rename`
+  wraps each `TableScan` in a projection whose expressions are literally
+  `Expr::Column(real_column).alias_qualified(relation, "#N")`
+  (`crates/sail-plan/src/resolver/query/read.rs:558` → `rename_logical_plan`,
+  `crates/sail-common-datafusion/src/rename/logical_plan.rs:7`) *(verified)*. The
+  `#N → (dataset, real name)` mapping is therefore in the plan itself, with no global state.
+- **Roots.** Spark's `OutputFieldsCollector` matches output columns at `Project`/`Aggregate`
+  nodes against the schema. Sail has `NamedPlan.fields`, which is precisely the ordered list of
+  user-facing output names.
+
+Two edge cases the extractor must handle rather than assume away:
+
+- **Do not pattern-match on node shape.** The rename projection sits directly above the scan in
+  the *resolved* plan, but `optimize_projections` may merge it into a neighbouring projection.
+  The alias survives — renaming has to, for downstream references to resolve — but its position
+  does not. Resolve `#N` by following column dependencies down to a scan, as Spark's collector
+  does, not by expecting a particular parent node.
+- **Duplicate column names take a different path.** When a scan's schema has duplicate names,
+  `resolve_table_source_with_rename` skips the projection and wraps the *provider* in
+  `RenameTableProvider` instead (`crates/sail-plan/src/resolver/query/read.rs:532`), so the
+  scan's own schema is already `#N` and the real names live inside the provider. Reachable, but
+  it is a second code path, and the one most likely to be missed.
+
+That removes the need to touch `PlanResolverState`, `NamedPlan` or `resolve_and_execute_plan`
+at all for column lineage. It also means column lineage is no longer gated on a core API
+change, which moves it earlier in the phasing than the previous draft assumed.
+
+### 6.2 When the map would still be wanted
+
+Two cases, neither blocking:
+
+- **`transformationDescription`.** The facet allows a human-readable description of how an
+  output field was derived. Rendering `#7 + #3` is useless; rendering `price + tax` needs the
+  map. Emitting the field without a description is spec-legal, so this is a quality
+  improvement, not a prerequisite.
+- **Debugging the extractor itself.** `#N`-only lineage is miserable to eyeball in a golden
+  test.
+
+If it is wanted, the cheap route stands: when `lineage.enabled` is set, have `PlanResolver`
+stash the `#N → name` map in `LineageService` keyed by operation ID, and drop it when the run
+reaches a terminal state. Zero allocation when the feature is off, no core type widened, no
+signature changed — a side channel, but one that matches how `JobService` and `ActivityTracker`
+already carry per-session state.
+
+**The invasive alternative, for the record: widen `NamedPlan` and `resolve_and_execute_plan`.**
 
 ```rust
 // Sketch — not compiled.
@@ -446,9 +492,10 @@ query whether or not lineage is on, and it changes `resolve_and_execute_plan`'s 
 (currently `(Arc<dyn ExecutionPlan>, Vec<StringifiedPlan>)`) across five call sites in two
 crates. That is an invasive change to the hottest API in the codebase in service of an
 off-by-default observability feature, and a reviewer would be right to push back. Take this
-route only if the side channel proves unworkable.
+route only if the side channel proves unworkable — and per §6.1, most likely neither is
+needed.
 
-### 6.2 Which plan to extract from is an open decision
+### 6.3 Which plan to extract from is an open decision
 
 Not settled, and the tradeoff is real:
 
@@ -465,7 +512,7 @@ stating in user documentation whichever way it goes. Leaning toward the resolved
 *column* lineage (intent) and the optimized plan for *dataset* lineage (fact), if the
 inconsistency can be explained clearly — otherwise pick one.
 
-### 6.3 Expression extraction
+### 6.4 Expression extraction
 
 Mechanical: walk each `Projection`/`Aggregate`/`Window` and, for every output `Expr`, collect
 `Expr::Column` references via `Expr::column_refs()`, distinguishing `DIRECT` transformations
@@ -558,11 +605,22 @@ Wiring: register `LineageService` and `LineageExtractorRegistry` in
 
 ### 8.2 Emission must never block or fail a query
 
-Non-negotiable. The transport should own a bounded `tokio::sync::mpsc` channel and a
-background task; `emit()` does a `try_send` and increments a dropped-event counter on a full
-queue. A lineage backend being down, slow or misconfigured must degrade to a log line.
+Non-negotiable, and it has two halves — the first draft only had one.
+
+**Emission.** The transport owns a bounded `tokio::sync::mpsc` channel and a background task;
+`emit()` does a `try_send` and increments a dropped-event counter on a full queue. A lineage
+backend being down, slow or misconfigured must degrade to a log line.
 `sail-telemetry`'s `BatchLogProcessor` setup (`crates/sail-telemetry/src/telemetry.rs`) is
 the right model.
+
+**Extraction.** This is the half the first draft missed, and Spark's integration takes it
+seriously enough to run event processing under a circuit breaker that watches JVM health and
+interrupts the processing thread (§9.2). Extraction — plan walking, column-lineage
+construction, facet building — runs *on the query path*, and its cost scales with plan size,
+so a pathological plan could measurably slow a query that would otherwise be fast. Give it a
+wall-clock budget (`lineage.extraction_timeout_ms`), abandon the partial result on overrun,
+emit the run with whatever datasets were found plus a marker facet, and count the overruns.
+Degrading to incomplete lineage is correct; slowing the engine is not.
 
 The workspace lints help here: `unwrap_used`, `expect_used` and `panic` are all `deny` at the
 workspace level (`Cargo.toml:17-23`).
@@ -626,10 +684,49 @@ Following the declarative pattern in `crates/sail-common/src/config/application.
     a new job in the lineage catalog.
   experimental: true
 
+- key: lineage.parent_job_namespace
+  type: string
+  default: ""
+  description: |
+    The namespace of the parent job, for correlating Sail runs with an external
+    orchestrator such as Airflow. When set, the parent run facet refers to the
+    orchestrator task instead of the Sail session.
+  experimental: true
+
+- key: lineage.parent_job_name
+  type: string
+  default: ""
+  description: The name of the parent job in the external orchestrator.
+  experimental: true
+
+- key: lineage.parent_run_id
+  type: string
+  default: ""
+  description: The run ID of the parent job in the external orchestrator.
+  experimental: true
+
+- key: lineage.dataset.remove_path_pattern
+  type: string
+  default: ""
+  description: |
+    A regular expression whose matches are removed from dataset paths before they
+    become OpenLineage dataset names. Use it to strip partition subdirectories so
+    that partitioned writes resolve to a single dataset.
+  experimental: true
+
 - key: lineage.column_lineage
   type: boolean
   default: "true"
   description: Whether to compute the column-level lineage facet.
+  experimental: true
+
+- key: lineage.extraction_timeout_ms
+  type: number
+  default: "500"
+  description: |
+    The maximum time spent extracting lineage from a query plan.
+    Extraction is abandoned past this budget and the run is emitted with
+    whatever was found, so that lineage never slows down query execution.
   experimental: true
 
 - key: lineage.queue_size
@@ -644,9 +741,106 @@ Following the declarative pattern in `crates/sail-common/src/config/application.
 All keys are settable as `SAIL_LINEAGE__URL` etc. via the existing `figment` env-var
 mapping. `api_key` should use `secrecy::SecretString`, as the catalog credentials already do.
 
+The three `parent_*` keys deliberately mirror `spark.openlineage.parentJobNamespace`,
+`parentJobName` and `parentRunId`. Airflow's OpenLineage provider already sets those when it
+launches a Spark job, so matching the semantics means an existing orchestrated pipeline that
+swaps Spark for Sail keeps its lineage hierarchy without reconfiguration.
+
 ---
 
-## 9. Prior art and the build-vs-depend question
+## 9. Evaluation against the Spark OpenLineage integration
+
+OpenLineage's Spark integration is the reference implementation of this exact problem, in
+production for years. Checking the design against it is the cheapest available review.
+
+### 9.1 Where the designs agree
+
+| Concern | Spark integration | This design |
+| --- | --- | --- |
+| Run hierarchy | One run for the application; each action's run points at it via `ParentRunFacet` | §3.2, same shape |
+| Plan used for datasets | Optimized logical plan | §6.3, same default |
+| Dataset extraction | `QueryPlanVisitor`s (Scala `PartialFunction`) + `InputDatasetBuilder`/`OutputDatasetBuilder` | §5.1's `LineageExtractor`, same shape |
+| Third-party extension | Java `ServiceLoader` on `OpenLineageEventHandlerFactory` via `META-INF/services` | §5.2's registry — the Rust/Sail analogue |
+| Job name from output dataset | `spark.openlineage.jobName.appendDatasetName`, default **true** | §4.2, same conclusion |
+| Plan/debug facets off by default | `spark.logicalPlan`, `debug`, `spark_unknown` disabled by default | §7, `sail_physicalPlan` opt-in |
+| Never break the query | Every hook swallows exceptions; emission runs under a circuit breaker | §8.2 |
+
+The agreement on job naming is the most reassuring: §4 was reasoned from the spec's definition
+of a job, and Spark arrived at the same place empirically, then made it configurable because
+users needed to turn it off.
+
+### 9.2 What the comparison corrected
+
+**Column lineage was not blocked.** Spark's `ExprId` is structurally identical to Sail's `#N` —
+an opaque per-expression identifier with no user-facing name. Spark never resolves intermediate
+ones, because the `columnLineage` facet does not carry them. §6 has been rewritten accordingly;
+the proposed `NamedPlan` change and the `PlanResolverState` side channel are both unnecessary
+for the facet itself, which moves column lineage earlier in the phasing.
+
+**A bounded queue is not a circuit breaker.** §8.2 protected the *transport* with a bounded
+channel. Spark protects *event processing* — dataset building and facet construction — under a
+circuit breaker that watches JVM health and interrupts the processing thread. The expensive
+part is extraction, and extraction happens on the query path. Sail needs a budget there too,
+not only on emit. Now in §8.2.
+
+**Path normalization is a solved problem, and I was reinventing it.** §5.4 proposed a
+"longest non-glob prefix" rule for partitioned and globbed listing paths. Spark ships
+`spark.openlineage.dataset.removePath.pattern` — a user-supplied regex that strips subdirectory
+components from dataset paths. That is more honest: the engine cannot know whether
+`year=2024/` is part of the dataset identity or a partition, but the user can. Adopted in §5.4
+as `lineage.dataset.remove_path_pattern`, with the prefix rule as the default when unset.
+
+**The parent is not always the Sail session.** Spark exposes
+`spark.openlineage.parentJobNamespace`, `parentJobName` and `parentRunId` so an orchestrator —
+Airflow's OpenLineage provider sets exactly these — can inject itself as the parent, nesting the
+Spark run under the DAG task. A Spark-compatible engine that ignores this does not slot into
+existing orchestration, and its runs float unparented in the catalog. This design missed it
+entirely. Added to §8.3 as three settings with the same semantics.
+
+### 9.3 Where Sail is structurally better placed
+
+- **No listener bus.** Spark's integration rides `SparkListenerBus`, which drops events under
+  load — a known and much-reported source of silently missing lineage. Sail's extraction is
+  synchronous inside `resolve_and_execute_plan`; it can be slow, but it cannot silently drop.
+- **No reflection or version shims.** A large share of the Spark integration's complexity is
+  reflecting across Spark and vendor versions to reach fields that are not public API. Sail's
+  `TableSource`s and write nodes are typed, owned, and directly readable.
+- **Richer typed metadata at the leaf.** `DeltaSnapshot::version()` and the Iceberg snapshot ID
+  are simply available for the `version` facet; Spark's integration works to get the equivalent.
+- **One plan representation.** Spark maintains visitors for analyzed, optimized and physical
+  plans across multiple Spark majors. Sail has one resolver and one optimizer.
+
+### 9.4 Where Sail starts far behind
+
+- **Dataset coverage.** Spark ships visitors for JDBC, BigQuery, Snowflake, Redshift, Kafka,
+  Kinesis, Hive, Iceberg, Delta and more. Sail's coverage on day one is whatever formats have an
+  extractor — realistically listing, Delta, Iceberg and Python writes. Every other source a user
+  reaches through is invisible until someone writes its extractor. §5.2's registry makes that
+  additive rather than a fork, which is the mitigation, but it is not coverage.
+- **Years of edge cases.** Spark's integration encodes a great deal of hard-won knowledge about
+  what real plans look like. The Phase 0 spike (§13) exists to start collecting Sail's version of
+  that, and it should be expected to find things this note does not anticipate.
+- **A known-limitation analogue.** Spark's column lineage degrades on JDBC sources: the SQL
+  parser recovers table and field names but no transformation types. Sail's equivalent blind
+  spot is Python UDFs and `MapPartitionsNode` (§11.4). Same shape, same honest answer — emit the
+  edge as `INDIRECT` rather than dropping it.
+
+### 9.5 Deliberate divergences
+
+Two places where this design does *not* follow Spark, on purpose:
+
+- **Emit filtering defaults to writes-only.** Spark emits for every action and leaves catalog
+  hygiene to downstream filtering. §4.3 defaults to `writes`. Sail is faster and therefore
+  produces more actions per unit time, and a first-run experience that floods a catalog is worse
+  than one that under-reports and is opted into. This is a judgement call and reasonable people
+  would pick the other default.
+- **Two hierarchy levels, not three.** Spark distinguishes application → SQL execution → action.
+  Sail's funnel makes one execution one action, so §3.2 has session → execution. If Sail later
+  splits a single Spark Connect request into multiple internal jobs, this needs revisiting.
+
+---
+
+## 10. Prior art and the build-vs-depend question
 
 Two Rust crates now exist, both from the `open-lakehouse/headwaters` project, both
 Apache-2.0, both first published 2026-06-27:
@@ -688,7 +882,7 @@ resolves SQL to a typed plan, which is strictly better information, so it is not
 
 ---
 
-## 10. Gaps and open questions
+## 11. Gaps and open questions
 
 1. **Streaming.** `handle_execute_write_stream_operation_start` starts a long-running query.
    OpenLineage models this as one run with periodic `RUNNING` events, but Sail's streaming
@@ -718,20 +912,24 @@ resolves SQL to a typed plan, which is strictly better information, so it is not
    `TableFormat` and no extractor. Its datasets are silently absent rather than wrong, which is
    the better failure, but it is still silent. A `WARN` on first encountering an unclaimed
    source type would make it visible without failing anything.
-8. **Test strategy.** Golden-file tests over emitted JSON fit `sail-gold-test`, which the
+8. **Dataset coverage is the real adoption risk.** Per §9.4, Spark ships visitors for JDBC,
+   BigQuery, Snowflake, Redshift, Kafka, Kinesis and more. A user migrating from Spark will
+   compare lineage completeness, not architecture, and Sail starts with four extractors. The
+   registry makes this additive, but someone has to write them.
+9. **Test strategy.** Golden-file tests over emitted JSON fit `sail-gold-test`, which the
    repo already uses. Plus a Marquez container in `compose.yml` for an end-to-end check, and
    validation against the published `OpenLineage.json` schema. Add the format-coverage test
    from §5.2 and canonicalization unit tests from §5.4.
 
 ---
 
-## 11. Phasing
+## 12. Phasing
 
 | Phase | Deliverable | Rough shape |
 | --- | --- | --- |
 | **0** | Spike: per-format `LineageExtractor` impls + a visitor over the final logical plan, printing to stdout. Hardcoded list, no registry, no transport, no config, no job naming. Answers "does the plan carry what we need, and for how many real queries?" | small, throwaway |
 | **1** | Table-level lineage. `LineageExtractorRegistry` in `sail-common-datafusion` (§5.2) with extractors for listing, Delta, Iceberg and Python *writes*. `sail-lineage` crate, `LineageService`, config, job-identity and emit filtering (§4), HTTP + console transports, `START`/`COMPLETE`/`FAIL` from `handle_execute_plan`, `schema`/`dataSource`/`symlinks`/`lifecycleStateChange` facets, coverage test, Marquez end-to-end test. | the real milestone |
-| **2** | Python data source *reads*: retain name and options on `PythonTableProvider`, add the optional `lineage_identity()` hook (§5.3). Column-level lineage via §6.1, and the §6.2 decision. `outputStatistics` if §7's obstacles clear. Parent/child run correlation. | depends on Phase 1 |
+| **2** | Column-level lineage (§6.1) — no longer gated on a core API change, so it can start as soon as Phase 1's extractors exist. Python data source *reads*: retain name and options on `PythonTableProvider`, plus the optional `lineage_identity()` hook (§5.3). The §6.3 plan-choice decision. `outputStatistics` if §7's obstacles clear. | depends on Phase 1 |
 | **3** | Streaming runs, cluster-mode job facets, Flight SQL frontend, user documentation under `docs/guide/integrations/`. | long tail |
 
 Phase 1 is the point at which Sail becomes usable with Marquez, DataHub, Atlan, Astronomer
@@ -740,7 +938,7 @@ integration rather than merely equivalent.
 
 ---
 
-## 12. Smallest honest next step
+## 13. Smallest honest next step
 
 Phase 0, as one throwaway binary:
 
@@ -775,3 +973,8 @@ ugly about it.
 - [`datafusion-openlineage` crate](https://crates.io/crates/datafusion-openlineage)
 - [`open-lakehouse/headwaters`](https://github.com/open-lakehouse/headwaters)
 - [OpenLineage SQL integration (Rust)](https://github.com/OpenLineage/OpenLineage/tree/main/integration/sql)
+- [OpenLineage Spark integration](https://github.com/OpenLineage/OpenLineage/tree/main/integration/spark) — the reference implementation evaluated in §9
+- [Spark integration: main concepts](https://github.com/OpenLineage/docs/blob/main/docs/integrations/spark/main_concept.md)
+- [Spark integration: extending](https://github.com/OpenLineage/docs/blob/main/docs/integrations/spark/extending.md)
+- [Spark integration: column lineage](https://github.com/OpenLineage/docs/blob/main/docs/integrations/spark/spark_column_lineage.md)
+- [Spark integration: configuration](https://github.com/OpenLineage/docs/blob/main/docs/integrations/spark/configuration/spark_conf.md)
