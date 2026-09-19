@@ -32,7 +32,8 @@ Sail is unusually well positioned for OpenLineage:
   composes a `Vec<Arc<dyn ExtensionPlanner>>`, one contributed by each format crate
   (`crates/sail-session/src/planner.rs:72`), and each does its own concrete downcast in its
   own crate (`crates/sail-data-source/src/listing/planner.rs:85`). Lineage extraction should
-  mirror this exactly — see §5.1.
+  mirror this — as an *open registry* rather than a fixed list, because Sail already accepts
+  out-of-tree table formats at runtime. See §5.1–§5.2.
 
 The recommendation is a new `sail-lineage` crate plus a `LineageService` session extension,
 with explicit lifecycle calls in the Spark Connect and Flight SQL frontends. Table-level
@@ -266,11 +267,88 @@ does. `sail-session` composes the list — the same crate that already composes
 Honest cost of this shape: it is **runtime registration, not a compile-time contract**. Add a
 new format and forget to add its extractor and its datasets are silently invisible. An opt-in
 trait would have had the same gap; only a required method on `TableFormat` would force the
-issue, at the cost of breaking every format impl. Mitigation is a test that asserts every
-registered `TableFormat` name has a corresponding extractor, with an explicit opt-out list for
-the formats that genuinely have no dataset (`rate`, `socket`, `console`, `noop`).
+issue, at the cost of breaking every format impl. §5.2 covers the mitigation.
 
-### 5.2 Naming is not as clean as the table suggests
+### 5.2 The extractor registry
+
+A fixed `vec![...]` in `sail-session` would be the simplest thing, and it would be wrong:
+**Sail already accepts table formats it did not compile in.** `TableFormatRegistry` is an open
+runtime registry (`crates/sail-common-datafusion/src/datasource.rs:625`), and Python data
+sources self-register from installed packages through the `pysail.datasources` entry-point
+group (`crates/sail-data-source/src/formats/python/discovery.rs:28`). A statically enumerated
+extractor list could never cover a format discovered at startup from a user's site-packages.
+
+So the extractor list is a registry, shaped like the one next to it:
+
+```rust
+// Sketch — not compiled. Lives in sail-common-datafusion, beside TableFormatRegistry.
+pub struct LineageExtractorRegistry {
+    /// Ordered: registration order is precedence. Re-registering a name
+    /// replaces in place rather than appending.
+    extractors: RwLock<Vec<(String, Arc<dyn LineageExtractor>)>>,
+}
+
+impl LineageExtractorRegistry {
+    pub fn register(&self, name: &str, extractor: Arc<dyn LineageExtractor>) -> Result<()>;
+    pub fn read_dataset(&self, source: &dyn TableSource) -> Option<DatasetIdentity>;
+    pub fn write_dataset(&self, node: &dyn UserDefinedLogicalNode) -> Option<DatasetIdentity>;
+}
+
+impl SessionExtension for LineageExtractorRegistry {
+    fn name() -> &'static str { "LineageExtractorRegistry" }
+}
+```
+
+Registered as a session extension in `ServerSessionFactory::create_session_config`, next to
+`create_table_format_registry()`. An embedder with an out-of-tree Rust format registers its
+extractor exactly where it already registers its `TableFormat`; `sail-lineage` never learns
+the format exists.
+
+**A `Vec` scan, not a `TypeId` map.** The tempting optimization is to key extractors by the
+concrete `TypeId` of the source they handle, for O(1) dispatch. It does not work.
+`PythonTableFormat::create_source` returns `provider_as_source(Arc::new(PythonTableProvider::new(..)))`
+— a `DefaultTableSource` wrapping a provider. Every provider-backed format therefore presents
+the *same* `TypeId` at the `TableSource` level, so a `TypeId` map would collapse them all into
+one bucket. Delta, Iceberg and Listing return custom `TableSource`s; Python returns a wrapped
+provider. The trait must take `&dyn TableSource` and let each extractor unwrap however it
+needs. A linear scan over ~13 extractors per plan node is not worth optimizing.
+
+**Iteration order must be deterministic.** `TableFormatRegistry` stores a `HashMap`, which is
+fine for keyed lookup but not for a first-match scan: nondeterministic order would make the
+golden-file tests in §10.8 flaky and could silently change which extractor claims a node
+between runs. Hence the ordered `Vec`, with the name used only for dedup and override.
+
+**Conflict semantics.** First match wins. Two extractors claiming the same node is a bug, not
+a supported configuration — log once at `WARN` naming both, take the first, and never fail the
+query over it.
+
+**Coverage test.** For every name in `TableFormatRegistry`, assert that some extractor claims
+its sources and write nodes, or that the name appears in an explicit opt-out list for formats
+with no dataset (`rate`, `socket`, `console`, `noop`). Formats discovered at runtime cannot be
+covered statically, which is exactly why the Python extractor below must supply a fallback
+identity rather than returning `None`.
+
+### 5.3 Python data sources
+
+Worth its own treatment, because it is the case that proves the registry is load-bearing, and
+because reads and writes are currently asymmetric.
+
+- **Writes work today.** `PythonWriteNode` (`crates/sail-data-source/src/formats/python/table_format.rs:243`)
+  holds `name`, `mode` and `options`, so a `PythonLineageExtractor` can derive an identity now:
+  namespace `python://{format_name}`, name from the `path` option where present.
+- **Reads do not.** `PythonTableProvider` (`crates/sail-data-source/src/formats/python/table_provider.rs:26`)
+  holds only an executor, the pickled `command`, and a cached `schema` — no format name, no
+  options. A Python data source read is therefore invisible to lineage until the provider
+  retains the format name and the resolved options. That is a small, mechanical change with no
+  behavioural risk, and it is a prerequisite, not a nice-to-have.
+- **Let the Python author override the synthetic identity.** `python://csv_over_http` is a poor
+  dataset name; the author knows the real one. Read an optional `lineage_identity()` method off
+  the data source class and use it when present, falling back to the synthetic identity when it
+  is absent or raises. Call it once at plan time — never per batch. This does put Python on the
+  planning path, but `create_source` already calls `datasource.schema()` there, so it is not a
+  new class of risk; it does need the same care.
+
+### 5.4 Naming is not as clean as the table suggests
 
 Two unsolved cases, both real:
 
@@ -287,7 +365,7 @@ Two unsolved cases, both real:
   on the name) applied to *every* URI before it becomes a dataset name, with unit tests. This
   is small but it is the difference between a connected graph and confetti.
 
-### 5.3 Writes
+### 5.5 Writes
 
 Writes resolve to `LogicalPlan::Extension(BarrierNode { preconditions, input })`
 (`crates/sail-plan/src/resolver/command/write.rs:533`), where the inner node is
@@ -310,7 +388,7 @@ Two details worth getting right:
   `TruncateIf` (Delta `replaceWhere`) → `OVERWRITE` with the predicate in a
   `sail_replaceWhere` custom facet.
 
-### 5.4 Row-level operations
+### 5.6 Row-level operations
 
 MERGE / UPDATE / DELETE go through `sail-plan/src/resolver/command/{merge,delete}.rs` and
 produce plans containing both a read and a write of the same table, plus the internal
@@ -381,7 +459,7 @@ Not settled, and the tradeoff is real:
   what a lineage consumer wants to see, and is where `PlanResolverState` is still alive.
   But it over-reports — it claims columns were read that the engine never touched.
 
-Since §5.1's verification shows scans and write nodes survive optimization either way, this
+Since §1's verification shows scans and write nodes survive optimization either way, this
 is a semantics choice rather than a feasibility one. Worth deciding deliberately, and worth
 stating in user documentation whichever way it goes. Leaning toward the resolved plan for
 *column* lineage (intent) and the optimized plan for *dataset* lineage (fact), if the
@@ -403,7 +481,7 @@ Mechanical: walk each `Projection`/`Aggregate`/`Window` and, for every output `E
 | Facet | Source in Sail |
 | --- | --- |
 | `schema` (dataset) | `TableSource::schema()` / write node input schema |
-| `dataSource` (dataset) | the canonicalized URI from §5.2 |
+| `dataSource` (dataset) | the canonicalized URI from §5.4 |
 | `symlinks` (dataset) | `TableScan.table_name` and `LakehouseExecutionContext::catalog_table()` |
 | `columnLineage` (output dataset) | §6 |
 | `lifecycleStateChange` (output dataset) | `SinkMode` |
@@ -417,7 +495,7 @@ Mechanical: walk each `Projection`/`Aggregate`/`Window` and, for every output `E
 **Sail-specific (prefixed `sail_`):**
 
 - `sail_executionMode` — `local` / `local-cluster` / `kubernetes-cluster` from `AppConfig::mode`.
-- `sail_pathPattern` — the glob pattern for a listing source, per §5.2.
+- `sail_pathPattern` — the glob pattern for a listing source, per §5.4.
 - `sail_physicalPlan` — the `FinalPhysicalPlan` string that `resolve_and_execute_plan`
   already builds (`sail-plan/src/lib.rs:61`). Opt-in; plan strings are large and can contain
   literal values from the query.
@@ -451,7 +529,7 @@ crates/sail-lineage/
     config.rs        // LineageConfig ← AppConfig
     service.rs       // LineageService: SessionExtension (also holds the #N map, §6.1)
     event.rs         // RunEvent model + facets (serde)
-    naming.rs        // URL → (namespace, name), canonicalization, §2 + §5.2
+    naming.rs        // URL → (namespace, name), canonicalization, §2 + §5.4
     identity.rs      // job-name derivation and emit filtering, §4
     extract/
       mod.rs         // LogicalPlan → Lineage { inputs, outputs }
@@ -464,12 +542,19 @@ crates/sail-lineage/
 ```
 
 `sail-lineage` depends on `sail-common`, `sail-common-datafusion`, `datafusion` and
-`reqwest` — and deliberately **not** on the format crates, which is what the per-format
-`LineageExtractor` list in §5.1 buys.
+`reqwest` — and deliberately **not** on the format crates, which is what the extractor
+registry in §5.2 buys.
 
-Wiring: register `LineageService` in `ServerSessionFactory::create_session_config`
-(`crates/sail-session/src/session_factory/server.rs:124`), alongside `JobService` and
-`ActivityTracker`, and compose the extractor list next to `create_table_format_registry()`.
+Note what is *not* in this crate. `LineageExtractorRegistry`, the `LineageExtractor` trait and
+`DatasetIdentity` live in `sail-common-datafusion` beside `TableFormatRegistry`, because format
+crates must implement them without depending on `sail-lineage`, and because an embedder should
+be able to register an extractor whether or not lineage emission is compiled in. `sail-lineage`
+reads the registry off the session like any other extension.
+
+Wiring: register `LineageService` and `LineageExtractorRegistry` in
+`ServerSessionFactory::create_session_config`
+(`crates/sail-session/src/session_factory/server.rs:124`), alongside `JobService`,
+`ActivityTracker` and `create_table_format_registry()`.
 
 ### 8.2 Emission must never block or fail a query
 
@@ -623,10 +708,20 @@ resolves SQL to a typed plan, which is strictly better information, so it is not
    dropped — a missing edge is worse than a vague one.
 5. **PII in facets.** `sql` and `sail_physicalPlan` facets embed literal values from user
    queries. Both should be opt-in, and this should be stated in the user documentation.
-6. **Test strategy.** Golden-file tests over emitted JSON fit `sail-gold-test`, which the
+6. **Python data source reads are invisible until `PythonTableProvider` changes.**
+   Per §5.3, the provider retains no format name and no options, so there is nothing to build
+   a dataset identity from. Writes are unaffected. This is a prerequisite for the Python half
+   of §5.3, and it is the one place where lineage work reaches into an unrelated crate's data
+   structures — worth raising with whoever owns the Python data source path before starting.
+7. **Extractor registration is not enforced.** The §5.2 coverage test catches in-tree formats
+   that forget an extractor, but nothing catches an out-of-tree Rust format that registers a
+   `TableFormat` and no extractor. Its datasets are silently absent rather than wrong, which is
+   the better failure, but it is still silent. A `WARN` on first encountering an unclaimed
+   source type would make it visible without failing anything.
+8. **Test strategy.** Golden-file tests over emitted JSON fit `sail-gold-test`, which the
    repo already uses. Plus a Marquez container in `compose.yml` for an end-to-end check, and
    validation against the published `OpenLineage.json` schema. Add the format-coverage test
-   from §5.1 and canonicalization unit tests from §5.2.
+   from §5.2 and canonicalization unit tests from §5.4.
 
 ---
 
@@ -634,9 +729,9 @@ resolves SQL to a typed plan, which is strictly better information, so it is not
 
 | Phase | Deliverable | Rough shape |
 | --- | --- | --- |
-| **0** | Spike: per-format `LineageExtractor` impls + a visitor over the final logical plan, printing to stdout. No transport, no config, no job naming. Answers "does the plan carry what we need, and for how many real queries?" | small, throwaway |
-| **1** | Table-level lineage. `sail-lineage` crate, `LineageService`, config, job-identity and emit filtering (§4), HTTP + console transports, `START`/`COMPLETE`/`FAIL` from `handle_execute_plan`, `schema`/`dataSource`/`symlinks`/`lifecycleStateChange` facets, Marquez end-to-end test. | the real milestone |
-| **2** | Column-level lineage via §6.1, and the §6.2 decision. `outputStatistics` if §7's obstacles clear. Parent/child run correlation. | depends on Phase 1 |
+| **0** | Spike: per-format `LineageExtractor` impls + a visitor over the final logical plan, printing to stdout. Hardcoded list, no registry, no transport, no config, no job naming. Answers "does the plan carry what we need, and for how many real queries?" | small, throwaway |
+| **1** | Table-level lineage. `LineageExtractorRegistry` in `sail-common-datafusion` (§5.2) with extractors for listing, Delta, Iceberg and Python *writes*. `sail-lineage` crate, `LineageService`, config, job-identity and emit filtering (§4), HTTP + console transports, `START`/`COMPLETE`/`FAIL` from `handle_execute_plan`, `schema`/`dataSource`/`symlinks`/`lifecycleStateChange` facets, coverage test, Marquez end-to-end test. | the real milestone |
+| **2** | Python data source *reads*: retain name and options on `PythonTableProvider`, add the optional `lineage_identity()` hook (§5.3). Column-level lineage via §6.1, and the §6.2 decision. `outputStatistics` if §7's obstacles clear. Parent/child run correlation. | depends on Phase 1 |
 | **3** | Streaming runs, cluster-mode job facets, Flight SQL frontend, user documentation under `docs/guide/integrations/`. | long tail |
 
 Phase 1 is the point at which Sail becomes usable with Marquez, DataHub, Atlan, Astronomer
@@ -651,6 +746,8 @@ Phase 0, as one throwaway binary:
 
 1. Add a `LineageExtractor` impl in `sail-data-source`, `sail-delta-lake` and `sail-iceberg`,
    each doing its own concrete downcast, mirroring the existing `*PhysicalPlanner` types.
+   Keep them in a hardcoded list for the spike — the registry (§5.2) is Phase 1, and building
+   it before the trait shape is proven is backwards.
 2. Write a `LogicalPlan` visitor that collects inputs and outputs and prints them.
 3. Call it from `resolve_and_execute_plan` behind `SAIL_LINEAGE__ENABLED`.
 4. Run the existing Spark test suite against it and record, per query: did it find the
@@ -660,6 +757,12 @@ Step 4 is the point of the spike. It measures two things this note can only gues
 coverage gap (how many plans produce datasets the extractor cannot name) and the volume
 profile (what fraction of real executions are read-only). The second one decides whether §4's
 default is right, and that is the decision most expensive to get wrong later.
+
+One thing the spike should deliberately *not* settle is the trait signature. Taking
+`&dyn TableSource` and `&dyn UserDefinedLogicalNode` is forced by §5.2's `DefaultTableSource`
+problem, but whether `DatasetIdentity` needs more fields — partition columns, a format tag,
+storage-layer options — will only be clear once three real extractors exist. Let the spike be
+ugly about it.
 
 ---
 
