@@ -139,6 +139,42 @@ def test_delta_schema_enforcement_without_merge_schema(spark, tmp_path):
         df2.write.format("delta").mode("append").save(str(delta_path))
 
 
+def test_delta_schema_evolution_with_merge_schema_and_non_nullable_column(spark, tmp_path):
+    """mergeSchema adds new columns when the table has non-nullable columns."""
+    delta_path = tmp_path / "delta_merge_schema_non_nullable"
+
+    spark.range(2).write.format("delta").mode("overwrite").save(str(delta_path))
+    assert _delta_field(_latest_delta_schema(delta_path), "id")["nullable"] is False
+
+    spark.range(2, 4).selectExpr("id", "'new' AS extra").write.format("delta").mode("append").option(
+        "mergeSchema", "true"
+    ).save(str(delta_path))
+
+    assert [f["name"] for f in _latest_delta_schema(delta_path)["fields"]] == ["id", "extra"]
+    rows = spark.read.format("delta").load(str(delta_path)).orderBy("id").collect()
+    assert [row.asDict() for row in rows] == [
+        {"id": 0, "extra": None},
+        {"id": 1, "extra": None},
+        {"id": 2, "extra": "new"},
+        {"id": 3, "extra": "new"},
+    ]
+
+
+def test_delta_schema_enforcement_with_non_nullable_column(spark, tmp_path):
+    """New columns are rejected, not dropped, when the table has non-nullable columns."""
+    delta_path = tmp_path / "delta_no_merge_schema_non_nullable"
+
+    spark.range(2).write.format("delta").mode("overwrite").save(str(delta_path))
+
+    with pytest.raises(Exception, match=r"(?i)(schema|field)"):
+        spark.range(2, 4).selectExpr("id", "'new' AS extra").write.format("delta").mode("append").save(
+            str(delta_path)
+        )
+
+    assert [f["name"] for f in _latest_delta_schema(delta_path)["fields"]] == ["id"]
+    assert spark.read.format("delta").load(str(delta_path)).count() == 2  # noqa: PLR2004
+
+
 def test_delta_schema_allows_safe_cast_without_merge(spark, tmp_path):
     """Appending columns that can be safely widened should succeed without mergeSchema."""
     delta_path = tmp_path / "delta_safe_cast"

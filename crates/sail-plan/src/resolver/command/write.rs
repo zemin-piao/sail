@@ -825,6 +825,26 @@ impl PlanResolver<'_> {
         info: &TableInfo,
         state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
+        self.rewrite_write_input_with_unmatched_columns(input, column_match, info, false, state)
+            .await
+    }
+
+    /// Rewrite the write input for the target table.
+    ///
+    /// When `keep_unmatched_input_columns` is set and columns are matched by name,
+    /// input columns that do not match any table column are appended to the output
+    /// instead of being dropped. This lets the table writer decide how to handle them
+    /// (e.g. evolve the schema with `mergeSchema`, or reject the write otherwise).
+    pub(super) async fn rewrite_write_input_with_unmatched_columns(
+        &self,
+        input: LogicalPlan,
+        column_match: WriteColumnMatch,
+        info: &TableInfo,
+        keep_unmatched_input_columns: bool,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let keep_unmatched_input_columns =
+            keep_unmatched_input_columns && matches!(column_match, WriteColumnMatch::ByName);
         let has_column_expressions = info.columns.iter().any(|c| {
             c.generated_always_as.is_some() || info.has_column_default(c) || c.identity.is_some()
         });
@@ -839,11 +859,39 @@ impl PlanResolver<'_> {
             || requires_delta_not_null_metadata
             || missing_iceberg_columns
         {
-            self.rewrite_write_input_with_column_expressions(input, column_match, info, state)
-                .await
+            self.rewrite_write_input_with_column_expressions(
+                input,
+                column_match,
+                info,
+                keep_unmatched_input_columns,
+                state,
+            )
+            .await
         } else {
-            Self::rewrite_standard_write_input(input, column_match, info)
+            Self::rewrite_standard_write_input(
+                input,
+                column_match,
+                info,
+                keep_unmatched_input_columns,
+            )
         }
+    }
+
+    /// Returns the input columns that do not match any table column by name
+    /// (case-insensitive), in input order.
+    fn unmatched_input_columns(input: &LogicalPlan, info: &TableInfo) -> Vec<String> {
+        input
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|name| {
+                !info
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(name))
+            })
+            .collect()
     }
 
     /// Fast path for tables without column-level expressions (no generated columns,
@@ -852,9 +900,17 @@ impl PlanResolver<'_> {
         input: LogicalPlan,
         column_match: WriteColumnMatch,
         info: &TableInfo,
+        keep_unmatched_input_columns: bool,
     ) -> PlanResult<LogicalPlan> {
         let table_schema = Schema::new(info.columns.iter().map(|x| x.field()).collect::<Vec<_>>());
-        if input.schema().fields().len() != table_schema.fields().len() {
+        let unmatched_input_columns = if keep_unmatched_input_columns {
+            Self::unmatched_input_columns(&input, info)
+        } else {
+            vec![]
+        };
+        if input.schema().fields().len() - unmatched_input_columns.len()
+            != table_schema.fields().len()
+        {
             return Err(PlanError::invalid(format!(
                 "input schema for INSERT has {} fields, but table schema has {} fields",
                 input.schema().fields().len(),
@@ -906,6 +962,11 @@ impl PlanResolver<'_> {
                                 .map(|expr| expr.alias(name))
                         }
                     })
+                    .chain(
+                        unmatched_input_columns
+                            .iter()
+                            .map(|name| Ok(col(Column::from_name(name)).alias(name))),
+                    )
                     .collect::<PlanResult<Vec<_>>>()?;
                 Ok(LogicalPlanBuilder::new(input).project(expr)?.build()?)
             }
@@ -925,7 +986,7 @@ impl PlanResolver<'_> {
                     .map(|(column, name)| col(column).alias(name))
                     .collect::<Vec<_>>();
                 let plan = LogicalPlanBuilder::new(input).project(expr)?.build()?;
-                Self::rewrite_standard_write_input(plan, WriteColumnMatch::ByName, info)
+                Self::rewrite_standard_write_input(plan, WriteColumnMatch::ByName, info, false)
             }
         }
     }
@@ -954,6 +1015,7 @@ impl PlanResolver<'_> {
         input: LogicalPlan,
         column_match: WriteColumnMatch,
         info: &TableInfo,
+        keep_unmatched_input_columns: bool,
         state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
         let table_field_count = info.columns.len();
@@ -1045,6 +1107,21 @@ impl PlanResolver<'_> {
             let cast_expr = input_expr.cast_to(col.field().data_type(), input.schema())?;
             intermediate_aliases.push(cast_expr.alias(field_ids[idx].clone()));
         }
+        // Carry input columns that do not match any table column through the rewrite,
+        // so that the table writer can decide how to handle them.
+        let unmatched_input_columns = if keep_unmatched_input_columns {
+            Self::unmatched_input_columns(&input, info)
+                .into_iter()
+                .map(|name| {
+                    let field_id = state.register_field_name(name.clone());
+                    intermediate_aliases
+                        .push(col(Column::from_name(&name)).alias(field_id.clone()));
+                    (name, field_id)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
         let intermediate = LogicalPlanBuilder::new(input)
             .project(intermediate_aliases)?
             .build()?;
@@ -1171,6 +1248,9 @@ impl PlanResolver<'_> {
                 expr.alias(out_name)
             };
             final_exprs.push(alias);
+        }
+        for (name, field_id) in unmatched_input_columns {
+            final_exprs.push(col(Column::from_name(field_id)).alias(name));
         }
         Ok(LogicalPlanBuilder::new(plan_for_final_projection)
             .project(final_exprs)?

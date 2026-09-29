@@ -190,8 +190,17 @@ impl PlanResolver<'_> {
             bucket_by: None,
             properties: metadata.properties,
         };
+        // Keep input columns that are not in the table, so that the Delta writer can
+        // evolve the schema (`mergeSchema`) or reject the write, instead of the
+        // columns being silently dropped here.
         let input = self
-            .rewrite_write_input(input, WriteColumnMatch::ByName, &info, state)
+            .rewrite_write_input_with_unmatched_columns(
+                input,
+                WriteColumnMatch::ByName,
+                &info,
+                true,
+                state,
+            )
             .await?;
         self.apply_delta_check_constraints(input, constraints, state)
             .await

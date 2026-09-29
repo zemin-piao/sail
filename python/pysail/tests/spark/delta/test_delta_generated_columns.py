@@ -93,6 +93,22 @@ def test_dataframewriter_path_append_rejects_generated_column_mismatch(spark, tm
         df.write.format("delta").mode("append").save(str(delta_path))
 
 
+def test_dataframewriter_path_append_merge_schema_keeps_new_column(spark, tmp_path):
+    delta_path = tmp_path / "delta_generated_columns_merge_schema"
+    _create_empty_generated_column_table(delta_path)
+
+    spark.createDataFrame(
+        [(1, "A", "x")],
+        "some_id INT, some_category STRING, extra STRING",
+    ).write.format("delta").mode("append").option("mergeSchema", "true").save(str(delta_path))
+
+    rows = spark.read.format("delta").load(str(delta_path)).collect()
+
+    assert [row.asDict() for row in rows] == [
+        {"some_id": 1, "some_category": "A", "gen": 2, "extra": "x"},
+    ]
+
+
 def test_dataframewriter_path_overwrite_computes_omitted_generated_column(spark, tmp_path):
     delta_path = tmp_path / "delta_generated_columns_overwrite"
     _create_empty_generated_column_table(delta_path)
