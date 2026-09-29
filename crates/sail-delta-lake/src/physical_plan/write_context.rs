@@ -517,7 +517,11 @@ fn merge_schemas(table_schema: &Schema, input_schema: &Schema) -> Result<SchemaR
                 DeltaTypeConverter::promote_field_types(existing_field, input_field)?;
             field_map.insert(field_name, promoted_field);
         } else {
-            field_map.insert(field_name.clone(), input_field.as_ref().clone());
+            // Existing data files do not contain the new column, so it must be nullable.
+            field_map.insert(
+                field_name.clone(),
+                input_field.as_ref().clone().with_nullable(true),
+            );
             field_order.push(field_name);
         }
     }

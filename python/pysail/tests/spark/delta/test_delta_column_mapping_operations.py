@@ -576,10 +576,6 @@ def test_column_mapped_schema_evolution(spark: SparkSession, table_pair: _TableP
         assert df.schema["s"].dataType["added"].dataType == IntegerType()
 
 
-@pytest.mark.xfail(
-    reason="reading old files after a mergeSchema append of a non-nullable column fails, also without column mapping",
-    strict=True,
-)
 def test_column_mapped_schema_evolution_non_nullable_column(spark: SparkSession, table_pair: _TablePair) -> None:
     evolved = _load_rows(spark, [_row(12, "g1", a=12, b="evolved", c=120)]).withColumn("extra", F.lit("e"))
     options = {"partitionBy": "grp"} if table_pair.partitioned else {}
@@ -587,10 +583,6 @@ def test_column_mapped_schema_evolution_non_nullable_column(spark: SparkSession,
     table_pair.assert_same()
 
 
-@pytest.mark.skip(
-    reason="reading old files after a mergeSchema append of a non-nullable nested field panics the server,"
-    " also without column mapping"
-)
 def test_column_mapped_schema_evolution_non_nullable_nested_field(spark: SparkSession, table_pair: _TablePair) -> None:
     evolved = _load_rows(spark, [_row(12, "g1", a=12, b="evolved", c=120)]).withColumn(
         "s", F.col("s").withField("added", F.lit(1))

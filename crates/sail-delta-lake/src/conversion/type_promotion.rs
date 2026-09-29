@@ -73,7 +73,8 @@ impl DeltaTypeConverter {
                         let merged_child = Self::promote_field_types(&existing, inf.as_ref())?;
                         merged_fields.insert(name, merged_child);
                     } else {
-                        merged_fields.insert(name, inf.as_ref().clone());
+                        // Existing data files do not contain the new field, so it must be nullable.
+                        merged_fields.insert(name, inf.as_ref().clone().with_nullable(true));
                     }
                 }
                 let merged_children: Vec<Field> = merged_fields.into_values().collect();

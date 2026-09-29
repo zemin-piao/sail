@@ -167,9 +167,7 @@ def test_delta_schema_enforcement_with_non_nullable_column(spark, tmp_path):
     spark.range(2).write.format("delta").mode("overwrite").save(str(delta_path))
 
     with pytest.raises(Exception, match=r"(?i)(schema|field)"):
-        spark.range(2, 4).selectExpr("id", "'new' AS extra").write.format("delta").mode("append").save(
-            str(delta_path)
-        )
+        spark.range(2, 4).selectExpr("id", "'new' AS extra").write.format("delta").mode("append").save(str(delta_path))
 
     assert [f["name"] for f in _latest_delta_schema(delta_path)["fields"]] == ["id"]
     assert spark.read.format("delta").load(str(delta_path)).count() == 2  # noqa: PLR2004
