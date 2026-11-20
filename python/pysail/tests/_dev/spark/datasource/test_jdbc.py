@@ -8,6 +8,7 @@ All tests run against the container using the Sail Spark Connect server.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,72 @@ def test_custom_schema(spark, jdbc_opts):
     schema_map = {f.name: f.dataType.simpleString() for f in df.schema.fields}
     assert "double" in schema_map.get("price", "")
     assert "int" in schema_map.get("quantity", "")
+
+
+# ---------------------------------------------------------------------------
+# customSchema DECIMAL override preserves Postgres numeric precision
+# ---------------------------------------------------------------------------
+
+
+def test_custom_schema_decimal_precision(spark, jdbc_opts):
+    df = (
+        spark.read.format("jdbc")
+        .option("dbtable", "decimal_test")
+        .option("customSchema", "v DECIMAL(38,18)")
+        .options(**jdbc_opts)
+        .load()
+    )
+    assert df.schema["v"].dataType.simpleString() == "decimal(38,18)"
+    rows = {r.id: r.v for r in df.collect()}
+    assert rows[1] == Decimal("1.123456789012345678")
+    assert rows[3] is None
+
+
+def test_custom_schema_decimal_rounding(spark, jdbc_opts):
+    df = (
+        spark.read.format("jdbc")
+        .option("dbtable", "decimal_test")
+        .option("customSchema", "v DECIMAL(38,2)")
+        .options(**jdbc_opts)
+        .load()
+    )
+    rows = {r.id: r.v for r in df.collect()}
+    assert rows[2] == Decimal("1.24")  # HALF_UP, like Spark
+    assert rows[3] is None
+
+
+def test_custom_schema_decimal_partitioned(spark, jdbc_opts):
+    df = (
+        spark.read.format("jdbc")
+        .option("dbtable", "decimal_test")
+        .option("partitionColumn", "id")
+        .option("lowerBound", "1")
+        .option("upperBound", "3")
+        .option("numPartitions", "2")
+        .option("customSchema", "v DECIMAL(38,18)")
+        .options(**jdbc_opts)
+        .load()
+    )
+    rows = {r.id: r.v for r in df.collect()}
+    assert len(rows) == 3
+    assert rows[1] == Decimal("1.123456789012345678")
+    assert rows[2] == Decimal("1.235")
+    assert rows[3] is None
+
+
+def test_custom_schema_decimal_query_with_filter(spark, jdbc_opts):
+    df = (
+        spark.read.format("jdbc")
+        .option("query", "SELECT id, v FROM decimal_test")
+        .option("customSchema", "v DECIMAL(38,18)")
+        .options(**jdbc_opts)
+        .load()
+        .filter("v > 1.2")
+    )
+    rows = df.collect()
+    assert len(rows) == 1
+    assert rows[0].id == 2
+    assert rows[0].v == Decimal("1.235000000000000000")
 
 
 # ---------------------------------------------------------------------------
@@ -651,3 +718,110 @@ def test_quote_identifier_unit():
     assert _quote_identifier("my col") == '"my col"'
     assert _quote_identifier('col"name') == '"col""name"'
     assert _quote_identifier("") == '""'
+
+
+def test_text_to_decimal_unit():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _text_to_decimal
+
+    def arr(values):
+        return pa.chunked_array([pa.array(values)])
+
+    out = _text_to_decimal(arr(["1.235", None, "2.5"]), pa.decimal128(38, 2))
+    assert out.to_pylist() == [Decimal("1.24"), None, Decimal("2.50")]  # HALF_UP, NULL preserved
+
+    out = _text_to_decimal(arr(["1.123456789012345678"]), pa.decimal128(38, 18))
+    assert out.to_pylist() == [Decimal("1.123456789012345678")]
+
+    assert _text_to_decimal(arr(["-1.235"]), pa.decimal128(38, 2)).to_pylist() == [Decimal("-1.24")]
+    assert _text_to_decimal(arr(["1.5"]), pa.decimal128(38, 0)).to_pylist() == [Decimal(2)]
+
+    # Overflows only after rounding up.
+    with pytest.raises(ValueError, match="does not fit"):
+        _text_to_decimal(arr(["99.995"]), pa.decimal128(4, 2))
+    with pytest.raises(ValueError, match="does not fit"):
+        _text_to_decimal(arr(["123.45"]), pa.decimal128(4, 2))
+    with pytest.raises(ValueError, match="does not fit"):
+        _text_to_decimal(arr(["99999999999999999999999999999999999999.9"]), pa.decimal128(38, 2))
+
+    with pytest.raises(ValueError, match="cannot be converted"):
+        _text_to_decimal(arr(["abc"]), pa.decimal128(38, 2))
+
+    for bad in ["NaN", "Infinity", "-Infinity"]:
+        with pytest.raises(ValueError, match="NaN or Infinity"):
+            _text_to_decimal(arr([bad]), pa.decimal128(38, 2))
+
+
+def test_partition_queries_select_list_unit():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSourceReader
+
+    def make_reader(**overrides):
+        kwargs = {
+            "conn_str": "postgresql://h/db",
+            "dbtable": "t",
+            "query": None,
+            "num_partitions": 1,
+            "partition_column": None,
+            "lower_bound": None,
+            "upper_bound": None,
+            "push_down_predicate": True,
+            "select_columns": None,
+            "decimal_columns": {},
+        }
+        kwargs.update(overrides)
+        return JdbcDataSourceReader(**kwargs)
+
+    reader = make_reader(
+        select_columns=['"id"', 'CAST("v" AS TEXT) AS "v"'],
+        decimal_columns={"v": pa.decimal128(38, 18)},
+    )
+    assert reader.partitions()[0].query == 'SELECT "id", CAST("v" AS TEXT) AS "v" FROM t'
+
+    reader = make_reader(
+        num_partitions=2,
+        partition_column="id",
+        lower_bound=0,
+        upper_bound=10,
+        select_columns=['"id"', 'CAST("v" AS TEXT) AS "v"'],
+        decimal_columns={"v": pa.decimal128(38, 18)},
+    )
+    queries = [p.query for p in reader.partitions()]
+    assert queries == [
+        'SELECT "id", CAST("v" AS TEXT) AS "v" FROM t WHERE ("id" < 5 OR "id" IS NULL)',
+        'SELECT "id", CAST("v" AS TEXT) AS "v" FROM t WHERE "id" >= 5',
+    ]
+
+    # Without overrides the partition queries are unchanged.
+    reader = make_reader()
+    assert reader.partitions()[0].query == "SELECT * FROM t"
+
+    reader = make_reader(num_partitions=2, partition_column="id", lower_bound=0, upper_bound=10)
+    queries = [p.query for p in reader.partitions()]
+    assert queries == [
+        'SELECT * FROM t WHERE ("id" < 5 OR "id" IS NULL)',
+        'SELECT * FROM t WHERE "id" >= 5',
+    ]
+
+
+def test_decimal_overrides_duplicate_columns_unit(monkeypatch):
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    monkeypatch.setattr(
+        jdbc.JdbcDataSource,
+        "_inferred_schema",
+        lambda _self, _resolved: pa.schema([pa.field("v", pa.utf8()), pa.field("v", pa.utf8())]),
+    )
+    datasource = jdbc.JdbcDataSource(
+        options={
+            "url": "jdbc:postgresql://localhost:5432/db",
+            "dbtable": "t",
+            "customSchema": "v DECIMAL(38,18)",
+        }
+    )
+    with pytest.raises(ValueError, match="unique column names"):
+        datasource._decimal_overrides(datasource._resolve_options())  # noqa: SLF001

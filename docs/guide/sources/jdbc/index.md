@@ -70,7 +70,7 @@ the [PySpark JDBC documentation](https://spark.apache.org/docs/latest/sql-data-s
 | `numPartitions`     | No       | `1`     | The number of parallel read partitions.                                                                          |
 | `fetchsize`         | No       | `0`     | An advisory rows-per-round-trip hint.                                                                            |
 | `pushDownPredicate` | No       | `true`  | Whether to push `WHERE` filters to the database.                                                                 |
-| `customSchema`      | No       |         | A Spark DDL string to override inferred column types.                                                            |
+| `customSchema`      | No       |         | A Spark DDL string to override inferred column types. See the note on Postgres `numeric` columns below.          |
 
 ::: info
 Exactly one of the `dbtable` or `query` options is required.
@@ -159,3 +159,9 @@ df = (
 ```
 
 Columns not listed in `customSchema` retain their inferred types.
+
+::: info Postgres `numeric` columns
+connectorX infers every Postgres `numeric` column as `DECIMAL(38, 10)`, so digits past scale 10 are truncated by
+default. Declare a `customSchema` `DECIMAL(p, s)` to keep a higher scale — the column is then read as text and converted
+exactly, rounding HALF_UP like Spark. Values that do not fit the declared precision raise an error.
+:::

@@ -128,3 +128,9 @@ INSERT INTO analytics.events (event_name, user_id) VALUES
     ('click',     2),
     ('purchase',  1),
     ('logout',    3);
+
+CREATE TABLE IF NOT EXISTS decimal_test (
+    id  SERIAL PRIMARY KEY,
+    v   NUMERIC(38, 18)
+);
+INSERT INTO decimal_test (v) VALUES (1.123456789012345678), (1.235), (NULL);

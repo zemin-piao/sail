@@ -13,6 +13,7 @@ Install the optional dependency before use::
 from __future__ import annotations
 
 import datetime
+import decimal
 from urllib.parse import quote
 
 try:
@@ -93,6 +94,33 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _text_to_decimal(arr: pa.ChunkedArray, typ: pa.Decimal128Type) -> pa.Array:
+    """Parse text values into ``Decimal128(p, s)``, rounding HALF_UP like Spark's ``Decimal(bd, p, s)``."""
+    quantum = decimal.Decimal(1).scaleb(-typ.scale)
+    values: list[decimal.Decimal | None] = []
+    for v in arr.to_pylist():
+        if v is None:
+            values.append(None)
+            continue
+        try:
+            d = decimal.Decimal(v)
+        except decimal.InvalidOperation:
+            msg = f"Value cannot be converted to {typ}"
+            raise ValueError(msg) from None
+        if not d.is_finite():
+            msg = f"Value is NaN or Infinity and cannot be converted to {typ}"
+            raise ValueError(msg)
+        try:
+            with decimal.localcontext() as ctx:
+                ctx.prec = typ.precision
+                d = d.quantize(quantum, rounding=decimal.ROUND_HALF_UP)
+        except decimal.InvalidOperation:
+            msg = f"Value does not fit in {typ}"
+            raise ValueError(msg) from None
+        values.append(d)
+    return pa.array(values, type=typ)
+
+
 # ============================================================================
 # Filter helpers
 # ============================================================================
@@ -160,6 +188,8 @@ class JdbcDataSourceReader(DataSourceReader):
         lower_bound: int | None,
         upper_bound: int | None,
         push_down_predicate: bool,
+        select_columns: list[str] | None,
+        decimal_columns: dict[str, pa.Decimal128Type],
     ) -> None:
         self.conn_str = conn_str
         self.dbtable = dbtable
@@ -169,6 +199,8 @@ class JdbcDataSourceReader(DataSourceReader):
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         self.push_down_predicate = push_down_predicate
+        self.select_columns = select_columns
+        self.decimal_columns = decimal_columns
         self._sql_filters: list[str] = []
 
     # ------------------------------------------------------------------
@@ -197,13 +229,16 @@ class JdbcDataSourceReader(DataSourceReader):
             return f"({self.query}) AS _cx_subq"
         return self.dbtable  # type: ignore[return-value]
 
+    def _select_list(self) -> str:
+        return ", ".join(self.select_columns) if self.select_columns is not None else "*"
+
     def partitions(self) -> list[InputPartition]:
         base = self._base_ref()
 
         if self.num_partitions <= 1 or self.partition_column is None:
             # Single partition — may include pushed-down filters
             where = _build_where(self._sql_filters)
-            q = f"SELECT * FROM {base}{where}"  # noqa: S608
+            q = f"SELECT {self._select_list()} FROM {base}{where}"  # noqa: S608
             return [JdbcInputPartition(0, q, self.conn_str)]
 
         # Range-stride partitioning
@@ -228,7 +263,7 @@ class JdbcDataSourceReader(DataSourceReader):
                 range_cond = f"{col} >= {s_lb} AND {col} < {s_ub}"
 
             conditions = [range_cond, *self._sql_filters]
-            q = f"SELECT * FROM {base} WHERE {' AND '.join(conditions)}"  # noqa: S608
+            q = f"SELECT {self._select_list()} FROM {base} WHERE {' AND '.join(conditions)}"  # noqa: S608
             parts.append(JdbcInputPartition(i, q, self.conn_str))
 
         return parts
@@ -247,6 +282,15 @@ class JdbcDataSourceReader(DataSourceReader):
         except Exception as e:
             msg = f"JDBC read failed. Query: {partition.query!r}. Error: {e}"
             raise RuntimeError(msg) from e
+
+        for name, typ in self.decimal_columns.items():
+            idx = table.schema.get_field_index(name)
+            try:
+                converted = _text_to_decimal(table.column(idx), typ)
+            except ValueError as e:
+                msg = f"Failed to convert column {name!r} to {typ}: {e}"
+                raise ValueError(msg) from e
+            table = table.set_column(idx, table.field(idx).with_type(typ), converted)
 
         yield from table.to_batches()
 
@@ -319,6 +363,11 @@ class JdbcDataSource(DataSource):
     +--------------------+----------+---------+--------------------------------------------+
 
     * Exactly one of ``dbtable`` or ``query`` is required.
+
+    Postgres ``numeric`` columns are inferred as ``DECIMAL(38, 10)`` by
+    connectorX, so digits past scale 10 are truncated.  Declare a
+    ``customSchema`` ``DECIMAL(p, s)`` to keep a higher scale; values are
+    rounded HALF_UP like Spark.
 
     Not supported: ``driver``, ``predicates`` list, write operations,
     ``queryTimeout``, ``isolationLevel``, ``sessionInitStatement``, Kerberos.
@@ -432,8 +481,7 @@ class JdbcDataSource(DataSource):
     # Schema inference
     # ------------------------------------------------------------------
 
-    def schema(self) -> pa.Schema:
-        resolved = self._resolve_options()
+    def _inferred_schema(self, resolved: dict) -> pa.Schema:
         conn_str = resolved["conn_str"]
         dbtable = resolved["dbtable"]
         query = resolved["query"]
@@ -450,7 +498,11 @@ class JdbcDataSource(DataSource):
             msg = f"Failed to infer schema from JDBC source. Query: {schema_query!r}. Error: {e}"
             raise RuntimeError(msg) from e
 
-        inferred = table.schema
+        return table.schema
+
+    def schema(self) -> pa.Schema:
+        resolved = self._resolve_options()
+        inferred = self._inferred_schema(resolved)
 
         custom_schema_ddl = self.options.get("customSchema") or None
         if custom_schema_ddl:
@@ -464,7 +516,51 @@ class JdbcDataSource(DataSource):
 
     def reader(self, schema: pa.Schema) -> JdbcDataSourceReader:  # noqa: ARG002
         resolved = self._resolve_options()
-        return JdbcDataSourceReader(**resolved)
+        select_columns, decimal_columns = self._decimal_overrides(resolved)
+        return JdbcDataSourceReader(
+            **resolved,
+            select_columns=select_columns,
+            decimal_columns=decimal_columns,
+        )
+
+    def _decimal_overrides(self, resolved: dict) -> tuple[list[str] | None, dict[str, pa.Decimal128Type]]:
+        """Render the select list and decimal targets for ``customSchema`` DECIMAL overrides.
+
+        connectorX maps every Postgres ``numeric`` to ``Decimal128(38, 10)``, so digits
+        past scale 10 are lost before the declared ``customSchema`` can apply.  For
+        Postgres only, columns declared DECIMAL/NUMERIC in ``customSchema`` are read as
+        ``CAST(col AS TEXT)`` and converted in :meth:`JdbcDataSourceReader.read`.
+        """
+        conn_str = resolved["conn_str"]
+        custom_schema_ddl = self.options.get("customSchema") or None
+        if not custom_schema_ddl or not conn_str.startswith(("postgres://", "postgresql://")):
+            return None, {}
+
+        overrides = _parse_custom_schema(custom_schema_ddl)
+        if not any(isinstance(t, pa.Decimal128Type) for t in overrides.values()):
+            return None, {}
+
+        inferred = self._inferred_schema(resolved)
+        names = [f.name for f in inferred]
+        duplicated = sorted({n for n in names if names.count(n) > 1})
+        if duplicated:
+            msg = f"customSchema DECIMAL overrides require unique column names; duplicated: {duplicated}"
+            raise ValueError(msg)
+
+        select_columns: list[str] = []
+        decimal_columns: dict[str, pa.Decimal128Type] = {}
+        for f in inferred:
+            quoted = _quote_identifier(f.name)
+            target = overrides.get(f.name.lower())
+            if isinstance(target, pa.Decimal128Type):
+                select_columns.append(f"CAST({quoted} AS TEXT) AS {quoted}")
+                decimal_columns[f.name] = target
+            else:
+                select_columns.append(quoted)
+
+        if not decimal_columns:
+            return None, {}
+        return select_columns, decimal_columns
 
 
 # ============================================================================
